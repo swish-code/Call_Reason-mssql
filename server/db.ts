@@ -1,0 +1,2009 @@
+import pkg from "pg";
+import bcrypt from "bcryptjs";
+import { User, Interaction, Brand, Category, Branch, AuditLog, DropdownOption, OpsLog, AssignedTask } from "../src/types.js";
+
+const { Pool } = pkg;
+
+// ----------------------------------------------------
+// Postgres connection pool
+// ----------------------------------------------------
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error(
+    "DATABASE_URL is not set. This app now persists data in PostgreSQL. " +
+      "On Railway link the Postgres service (DATABASE_URL=${{Postgres.DATABASE_URL}}); " +
+      "for local development point it to a Postgres instance."
+  );
+}
+
+// Railway's private network does not use SSL. Allow opting into SSL (e.g. when
+// connecting through the public proxy URL) via PGSSL=require.
+const useSSL = process.env.PGSSL === "require" || /sslmode=require/.test(connectionString);
+
+const pool = new Pool({
+  connectionString,
+  ssl: useSSL ? { rejectUnauthorized: false } : undefined,
+});
+
+// Helper to format ISO dates relative to today (used only for seed data)
+function getDateRelative(daysOffset: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() + daysOffset);
+  return date.toISOString().split("T")[0];
+}
+
+// ----------------------------------------------------
+// Seed data (inserted only when tables are empty)
+// ----------------------------------------------------
+const SEED_USERS: User[] = [
+  { id: "u-admin", full_name: "Ahmed Kamal (System Admin)", name: "Ahmed Kamal (System Admin)", username: "admin", email: "admin@crm.com", password_hash: bcrypt.hashSync("password", 10), role: "admin", team: "Team Leader", status: "Active", created_at: new Date().toISOString(), updated_at: new Date().toISOString(), created_by: "system" },
+  { id: "u-leader", full_name: "Sarah Mahmoud (Team Leader)", name: "Sarah Mahmoud (Team Leader)", username: "leader", email: "leader@crm.com", password_hash: bcrypt.hashSync("password", 10), role: "leader", team: "Team Leader", status: "Active", created_at: new Date().toISOString(), updated_at: new Date().toISOString(), created_by: "system" },
+  { id: "u-agent1", full_name: "Mohamed Ali (Support Agent)", name: "Mohamed Ali (Support Agent)", username: "agent1", email: "agent1@crm.com", password_hash: bcrypt.hashSync("password", 10), role: "agent", team: "Call Center", status: "Active", created_at: new Date().toISOString(), updated_at: new Date().toISOString(), created_by: "system" },
+  { id: "u-agent2", full_name: "Mariam Hassan (Support Agent)", name: "Mariam Hassan (Support Agent)", username: "agent2", email: "agent2@crm.com", password_hash: bcrypt.hashSync("password", 10), role: "agent", team: "Complain Team", status: "Active", created_at: new Date().toISOString(), updated_at: new Date().toISOString(), created_by: "system" },
+  { id: "u-agent3", full_name: "Omar Khaled (Support Agent)", name: "Omar Khaled (Support Agent)", username: "agent3", email: "agent3@crm.com", password_hash: bcrypt.hashSync("password", 10), role: "agent", team: "Technical Team", status: "Active", created_at: new Date().toISOString(), updated_at: new Date().toISOString(), created_by: "system" },
+];
+
+// Company brands and the branches that belong to each (branches are per-brand)
+const BRAND_BRANCHES: Record<string, string[]> = {
+  "Yelo Pizza": ["Adaliya", "Khairan", "Jaber Al Ahmed", "Sabah Al Salem", "Vibes", "Qortuba", "Abdullah Al Salem (Dahiya)", "Fahaheel", "Jleeb Al Shuyoukh", "Egaila", "Salmiya", "Jabriya", "Ishbiliya", "Sabah Al Ahmed", "Ardhiya", "Maidan Hawally", "Yard", "Jahra", "Salwa", "Zahra", "Saad Al Abdullah", "Qurain", "Andalous"],
+  "Shawarma Shakir": ["Rai", "Qurain", "Salmiya", "Kuwait City", "Jahra", "Ardhiya", "Egaila", "Hawally", "Sabah Al Ahmed", "Bayan"],
+  "BBT": ["Shamiya", "Hilltop", "West Mishref", "Yard", "Salmiya", "Ardhiya", "Jahra", "Adaliya", "Shuhada", "Mangaf", "Saad Al Abdullah", "Sabah Al Ahmed", "Bayan", "Khairan", "Um Al Hyman"],
+  "Slice": ["Mishref", "Kuwait City", "Yard", "Adaliya", "Jabriya", "Ardhiya", "Jahra", "Salmiya"],
+  "Pattie Pattie": ["Adaliya", "Mishref", "Ardhiya", "Jahra", "Salmiya", "Yard", "Hawally"],
+  "Just C": ["Qortuba", "Yard"],
+  "Chili Pepper": ["Qortuba", "Yard", "Hawally"],
+  "Mishmash": ["Ardhiya", "Kaifan", "Mahboula", "Jabriya", "Sabah Al Salem", "Saad Al Abdullah", "Salmiya", "Khaithan", "Mangaf", "West Abdullah Al Mubarak", "Salwa", "Qadsiya", "Qurain", "Khairan"],
+  "Tabel": ["Ardhiya", "Qortuba", "Hawally", "Sabah Al Salem", "Salmiya", "Bneid Al Qar", "Mahboula", "Jahra", "Ahmadi", "Khairan"],
+  "FM": ["Yard", "Kuwait City", "Hawally", "Khaithan"],
+};
+
+const SEED_BRANDS: Brand[] = Object.keys(BRAND_BRANCHES).map((name, i) => ({ id: `b-${i + 1}`, brand_name: name }));
+
+// Flattened per-brand branches with deterministic ids (idempotent re-seed)
+const SEED_BRANCHES: Branch[] = (() => {
+  const out: Branch[] = [];
+  let i = 0;
+  for (const [brand, list] of Object.entries(BRAND_BRANCHES)) {
+    for (const bn of list) out.push({ id: `br-${++i}`, branch_name: bn, brand });
+  }
+  return out;
+})();
+
+// Default values for the admin-managed dropdown lists (Configuration page).
+// Each list is seeded once (only if it has no rows yet).
+const DEFAULT_OPTIONS: Record<string, string[]> = {
+  call_type: ["New Order", "Follow Up", "Complaint", "Inquiry", "Additional Request"],
+  customer_type: ["Customer", "Aggregator", "Driver"],
+  call_from: ["Customer", "Aggregator", "Driver"],
+  aggregator: ["Talabat", "Keeta", "Other Aggregators"],
+  complaint_reason: ["Late Delivery", "Late Preparation", "Missing Items", "Wrong Order", "Other"],
+  fcr: ["Solved", "Not Solved"],
+  priority: ["Low", "Medium", "High", "Critical"],
+  status: ["Open", "Pending", "Resolved", "Closed"],
+  team: ["Complain Team", "Call Center", "Technical Team", "Team Leader"],
+  call_direction: ["Inbound", "Outbound"],
+  department: ["Call Center", "Technical", "Complaints", "Quality"],
+  cc_activity: ["Survey", "Review", "Follow-up CST", "Handle Customer Issue", "Handle Complaint", "Follow-up Orders", "Open Branch", "Close Branch", "Floor Tasks", "Previous Tasks Follow-up", "Other"],
+  tech_activity: ["Delayed Orders Follow-up", "Aggregator Follow-up", "Missing Item Cases", "Wrong Dispatch Cases", "Big Order Confirmation", "Order Assignment", "Aggregator Comments", "Punch Orders", "Open Branch", "Busy Branch", "Close Branch", "Hide Item", "Unhide Item", "Follow-up Groups", "Cancellation Request", "Foodics / POS Issues", "Other"],
+  complaint_activity: ["Validation", "Escalation", "Coupon Request", "Email Complaint", "Social Media Complaint", "Agent Inquiry", "Customer Review", "Survey Result", "Follow-up Store", "Other"],
+  quality_activity: ["Call Monitoring & Evaluation", "Review Escalated Complaints", "Root Cause Analysis", "SOP & Policy Compliance", "Operational Accuracy", "QA Documentation", "Quality Reporting", "Calibration Management", "Coaching & Performance Follow-up", "Quality Improvement & Special Projects"],
+  tl_activity: ["Agent Coaching", "One-to-One Session", "Monthly Meeting", "Floor Task", "Validation Quality Review", "Agent Mistake Review", "Performance Feedback", "Other"],
+  cc_status: ["Open", "In Progress", "Completed"],
+  complaint_status: ["Solved", "Not Solved", "Waiting Feedback"],
+};
+
+const SEED_CATEGORIES: Category[] = [
+  { id: "c1", category_name: "Refund" },
+  { id: "c2", category_name: "Order Issue" },
+  { id: "c3", category_name: "Delivery Delay" },
+  { id: "c4", category_name: "Account Issue" },
+  { id: "c5", category_name: "Technical Issue" },
+  { id: "c6", category_name: "Payment Issue" },
+  { id: "c7", category_name: "Complaint" },
+  { id: "c8", category_name: "Other" },
+];
+
+const SEED_INTERACTIONS: Interaction[] = [
+  { id: "int-1", interaction_date: getDateRelative(0), interaction_time: "09:15", agent_id: "u-agent1", agent_name: "Mohamed Ali (Support Agent)", customer_name: "Yasser Farag", customer_phone: "+201011223344", interaction_type: "SR", communication_type: "Call", call_direction: "Inbound", brand: "Talabat", category: "Order Issue", call_reason: "Follow Up", team: "Call Center", priority: "High", status: "Resolved", summary: "Customer is complaining that order #4432 has not arrived and is delayed by more than an hour, despite the money being deducted from the electronic account.", action_taken: "Called driver and updated delivery location. Delivered order successfully and provided a compensatory voucher worth 50 EGP.", follow_up_required: false, created_at: new Date().toISOString() },
+  { id: "int-2", interaction_date: getDateRelative(0), interaction_time: "10:30", agent_id: "u-agent2", agent_name: "Mariam Hassan (Support Agent)", customer_name: "Rana Ahmed", customer_phone: "+201288776655", interaction_type: "Complaint", communication_type: "Call", call_direction: "Inbound", brand: "Amazon", category: "Refund", call_reason: "Complaint", branch: "Cairo - Nasr City", team: "Complain Team", priority: "Critical", status: "Pending", summary: "Customer complained about receiving a damaged product (broken phone screen), requesting an immediate refund.", action_taken: "Created refund request #RET-990 and updated shipment status to replacement. Awaiting courier pickup of damaged item tomorrow.", follow_up_required: true, follow_up_date: getDateRelative(1), follow_up_notes: "Follow up with courier to ensure pickup of the damaged item and issue cash refund to customer.", created_at: new Date().toISOString() },
+  { id: "int-3", interaction_date: getDateRelative(-1), interaction_time: "14:10", agent_id: "u-agent1", agent_name: "Mohamed Ali (Support Agent)", customer_name: "Khaled Saeed", customer_phone: "+201144556677", interaction_type: "Inquiry", communication_type: "Call", call_direction: "Inbound", brand: "Noon", category: "Account Issue", call_reason: "Inquiry", team: "Call Center", priority: "Low", status: "Closed", summary: "Customer asked about how to activate the e-wallet and use their refunded Noon balance.", action_taken: "Explained double-verification setup steps to fully activate the wallet and verified balance appeared successfully.", follow_up_required: false, created_at: new Date(new Date().setDate(new Date().getDate() - 1)).toISOString() },
+  { id: "int-4", interaction_date: getDateRelative(-2), interaction_time: "11:00", agent_id: "u-agent2", agent_name: "Mariam Hassan (Support Agent)", customer_name: "Hany Youssef", customer_phone: "+201555432101", interaction_type: "Escalation", communication_type: "Call", call_direction: "Outbound", brand: "Carrefour", category: "Delivery Delay", call_reason: "Complaint", branch: "Giza - Dokki", team: "Complain Team", priority: "High", status: "Open", summary: "Customer requested escalation for delayed groceries order since morning and wants supermarket to call them immediately.", action_taken: "Assigned order to delivery team leader and escalated ticket to regional team.", follow_up_required: true, follow_up_date: getDateRelative(1), follow_up_notes: "Call customer to confirm courier arrival.", created_at: new Date(new Date().setDate(new Date().getDate() - 2)).toISOString() },
+  { id: "int-5", interaction_date: getDateRelative(-3), interaction_time: "16:45", agent_id: "u-agent3", agent_name: "Omar Khaled (Support Agent)", customer_name: "Dina Ali", customer_phone: "+201099887766", interaction_type: "SR", communication_type: "Task", call_direction: "Inbound", brand: "Amazon", category: "Technical Issue", call_reason: "Follow Up", team: "Technical Team", priority: "Medium", status: "Resolved", summary: "Customer is facing technical issue with credit card declining during instant shipping payment.", action_taken: "Guided customer to update app, clear cache, and try alternative payment gateway; transaction completed successfully.", follow_up_required: false, created_at: new Date(new Date().setDate(new Date().getDate() - 3)).toISOString() },
+  { id: "int-6", interaction_date: getDateRelative(-4), interaction_time: "13:30", agent_id: "u-agent3", agent_name: "Omar Khaled (Support Agent)", customer_name: "Sherif Monir", customer_phone: "+201201928374", interaction_type: "Feedback", communication_type: "Call", call_direction: "Outbound", brand: "Talabat", category: "Other", call_reason: "Follow Up", team: "Technical Team", priority: "Low", status: "Closed", summary: "Welcome call and customer satisfaction survey regarding drivers and speed in Tagamoa.", action_taken: "Customer expressed complete satisfaction, rated 5 stars, and requested more weekend offers.", follow_up_required: false, created_at: new Date(new Date().setDate(new Date().getDate() - 4)).toISOString() },
+];
+
+// Columns that may be updated through the API (whitelist guards against
+// arbitrary fields in request bodies being written to the table).
+const USER_UPDATE_COLS = ["full_name", "name", "username", "email", "password_hash", "role", "level", "job_title", "team", "department", "status", "created_by"] as const;
+const INTERACTION_UPDATE_COLS = ["interaction_date", "interaction_time", "agent_id", "agent_name", "customer_name", "customer_phone", "interaction_type", "communication_type", "call_direction", "brand", "category", "call_reason", "order_number", "branch", "team", "customer_type", "call_from", "aggregator_name", "comments", "complaint_reason", "fcr", "priority", "status", "summary", "action_taken", "follow_up_required", "follow_up_date", "follow_up_notes", "attachments", "created_at"] as const;
+
+const LOG_COLS = ["log_type", "department", "activity_type", "status", "agent_id", "agent_name", "branch", "brand", "order_number", "aggregator", "customer_name", "complaint_id", "target_agent_name", "notes", "action_taken", "resolution_notes", "action_plan", "follow_up_date", "duration_seconds", "calls_reviewed", "created_at", "updated_at", "created_by"] as const;
+const LOG_UPDATE_COLS = ["department", "activity_type", "status", "branch", "brand", "order_number", "aggregator", "customer_name", "complaint_id", "target_agent_name", "notes", "action_taken", "resolution_notes", "action_plan", "follow_up_date", "duration_seconds", "calls_reviewed"] as const;
+
+export class DB {
+  // ----------------------------------------------------
+  // Schema creation + one-time seeding
+  // ----------------------------------------------------
+  static async init(): Promise<void> {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        name TEXT,
+        username TEXT NOT NULL,
+        email TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        level INTEGER,
+        job_title TEXT,
+        team TEXT,
+        status TEXT NOT NULL,
+        created_at TEXT,
+        updated_at TEXT,
+        created_by TEXT
+      );
+      CREATE TABLE IF NOT EXISTS brands (
+        id TEXT PRIMARY KEY,
+        brand_name TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS categories (
+        id TEXT PRIMARY KEY,
+        category_name TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS branches (
+        id TEXT PRIMARY KEY,
+        branch_name TEXT NOT NULL,
+        brand TEXT
+      );
+      CREATE TABLE IF NOT EXISTS interactions (
+        id TEXT PRIMARY KEY,
+        interaction_date TEXT,
+        interaction_time TEXT,
+        agent_id TEXT,
+        agent_name TEXT,
+        customer_name TEXT,
+        customer_phone TEXT,
+        interaction_type TEXT,
+        communication_type TEXT,
+        call_direction TEXT,
+        brand TEXT,
+        category TEXT,
+        call_reason TEXT,
+        order_number TEXT,
+        branch TEXT,
+        team TEXT,
+        customer_type TEXT,
+        call_from TEXT,
+        aggregator_name TEXT,
+        comments TEXT,
+        complaint_reason TEXT,
+        fcr TEXT,
+        priority TEXT,
+        status TEXT,
+        summary TEXT,
+        action_taken TEXT,
+        follow_up_required BOOLEAN DEFAULT false,
+        follow_up_date TEXT,
+        follow_up_notes TEXT,
+        attachments JSONB DEFAULT '[]'::jsonb,
+        created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id TEXT PRIMARY KEY,
+        timestamp TEXT,
+        operator_id TEXT,
+        operator_name TEXT,
+        operator_role TEXT,
+        category TEXT,
+        action TEXT,
+        details TEXT,
+        related_ref TEXT,
+        ip_address TEXT
+      );
+      CREATE TABLE IF NOT EXISTS options (
+        id TEXT PRIMARY KEY,
+        list_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        sort_order INTEGER DEFAULT 0,
+        active BOOLEAN DEFAULT true
+      );
+      CREATE TABLE IF NOT EXISTS assigned_tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        assigned_by TEXT,
+        assigned_by_name TEXT,
+        assigned_to TEXT,
+        assigned_to_name TEXT,
+        department TEXT,
+        priority TEXT,
+        due_date TEXT,
+        status TEXT DEFAULT 'New',
+        seen BOOLEAN DEFAULT false,
+        duration_seconds INTEGER DEFAULT 0,
+        note TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        completed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS recurring_templates (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        department TEXT,
+        priority TEXT DEFAULT 'Medium',
+        recurrence_type TEXT DEFAULT 'daily',
+        days_of_week TEXT,
+        due_time TEXT,
+        assign_mode TEXT DEFAULT 'pool',
+        active BOOLEAN DEFAULT true,
+        created_by TEXT,
+        created_by_name TEXT,
+        created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS shift_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        user_name TEXT,
+        department TEXT,
+        started_at TEXT,
+        ended_at TEXT,
+        duration_seconds INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS logs (
+        id TEXT PRIMARY KEY,
+        log_type TEXT NOT NULL,
+        department TEXT,
+        activity_type TEXT,
+        status TEXT,
+        agent_id TEXT,
+        agent_name TEXT,
+        branch TEXT,
+        brand TEXT,
+        order_number TEXT,
+        aggregator TEXT,
+        customer_name TEXT,
+        complaint_id TEXT,
+        target_agent_name TEXT,
+        notes TEXT,
+        action_taken TEXT,
+        resolution_notes TEXT,
+        action_plan TEXT,
+        follow_up_date TEXT,
+        started_at TEXT,
+        duration_seconds INTEGER DEFAULT 0,
+        running_since TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        created_by TEXT
+      );
+    `);
+
+    // Ratings / Reviews module tables
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS platforms (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS ratings (
+        id TEXT PRIMARY KEY,
+        brand_id TEXT NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
+        platform_id TEXT NOT NULL REFERENCES platforms(id) ON DELETE RESTRICT,
+        order_id TEXT NOT NULL,
+        rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+        review_text TEXT,
+        customer_phone TEXT,
+        requires_action BOOLEAN DEFAULT false,
+        action_status TEXT DEFAULT 'pending',
+        assigned_agent_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        action_note TEXT,
+        uploaded_by TEXT REFERENCES users(id),
+        uploaded_at TIMESTAMPTZ DEFAULT now(),
+        resolved_at TIMESTAMPTZ,
+        recorded_by TEXT REFERENCES users(id),
+        recorded_at TIMESTAMPTZ,
+        order_date TEXT,
+        customer_name TEXT,
+        branch TEXT,
+        filled_by TEXT,
+        following_date TEXT,
+        surveyed_by TEXT,
+        complaint_type TEXT,
+        complaint_cases TEXT,
+        complaint_status TEXT,
+        served_by TEXT,
+        note TEXT,
+        UNIQUE (brand_id, platform_id, order_id)
+      );
+      CREATE TABLE IF NOT EXISTS rating_call_attempts (
+        id TEXT PRIMARY KEY,
+        rating_id TEXT NOT NULL REFERENCES ratings(id) ON DELETE CASCADE,
+        agent_id TEXT REFERENCES users(id),
+        agent_name TEXT,
+        attempt_number SMALLINT,
+        outcome TEXT NOT NULL,
+        note TEXT,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_ratings_brand ON ratings(brand_id);
+      CREATE INDEX IF NOT EXISTS idx_ratings_action ON ratings(requires_action, action_status);
+      CREATE INDEX IF NOT EXISTS idx_ratings_agent ON ratings(assigned_agent_id);
+    `);
+
+    // Surveys module tables (Call Campaigns + Survey Records)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS survey_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
+        created_by TEXT REFERENCES users(id),
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS survey_questions (
+        id TEXT PRIMARY KEY,
+        template_id TEXT NOT NULL REFERENCES survey_templates(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        answer_type TEXT NOT NULL DEFAULT 'free_text',
+        options JSONB,
+        q_order INT DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS survey_campaigns (
+        id TEXT PRIMARY KEY,
+        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
+        requested_by TEXT REFERENCES users(id),
+        requester_role TEXT,
+        template_id TEXT REFERENCES survey_templates(id) ON DELETE SET NULL,
+        survey_type TEXT DEFAULT 'daily_normal',
+        assignment_mode TEXT DEFAULT 'open',
+        continuity_type TEXT DEFAULT 'one_time_slot',
+        requested_count INT DEFAULT 0,
+        duration_days INT DEFAULT 1,
+        status TEXT DEFAULT 'pending',
+        default_agent_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS survey_assignments (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT NOT NULL REFERENCES survey_campaigns(id) ON DELETE CASCADE,
+        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
+        customer_phone TEXT NOT NULL,
+        assigned_agent_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        attempt_count INT DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        scheduled_date DATE NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS survey_call_attempts (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL REFERENCES survey_assignments(id) ON DELETE CASCADE,
+        agent_id TEXT REFERENCES users(id),
+        attempt_number INT,
+        outcome TEXT NOT NULL,
+        note TEXT,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS survey_responses (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL REFERENCES survey_assignments(id) ON DELETE CASCADE,
+        agent_id TEXT REFERENCES users(id),
+        answered_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS survey_answers (
+        id TEXT PRIMARY KEY,
+        response_id TEXT NOT NULL REFERENCES survey_responses(id) ON DELETE CASCADE,
+        question_id TEXT REFERENCES survey_questions(id) ON DELETE SET NULL,
+        answer_value TEXT,
+        answered BOOLEAN DEFAULT false
+      );
+      CREATE TABLE IF NOT EXISTS customer_contacts (
+        id TEXT PRIMARY KEY,
+        brand_id TEXT REFERENCES brands(id) ON DELETE CASCADE,
+        phone_number TEXT NOT NULL,
+        last_contacted_at TIMESTAMPTZ DEFAULT now(),
+        last_contacted_brand_id TEXT,
+        UNIQUE (brand_id, phone_number)
+      );
+      CREATE TABLE IF NOT EXISTS survey_records (
+        id TEXT PRIMARY KEY,
+        record_type TEXT NOT NULL,
+        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
+        brand_label TEXT,
+        platform_id TEXT REFERENCES platforms(id) ON DELETE SET NULL,
+        platform_label TEXT,
+        order_id TEXT,
+        phone TEXT,
+        customer_name TEXT,
+        item_name TEXT,
+        rate SMALLINT,
+        product_feedback TEXT,
+        served_by TEXT,
+        answered BOOLEAN DEFAULT false,
+        customer_suggestion TEXT,
+        comment TEXT,
+        complaint TEXT,
+        note TEXT,
+        trials TEXT,
+        extra JSONB,
+        record_date TEXT,
+        uploaded_by TEXT REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_sa_sched ON survey_assignments(scheduled_date, status);
+      CREATE INDEX IF NOT EXISTS idx_sa_campaign ON survey_assignments(campaign_id);
+      CREATE INDEX IF NOT EXISTS idx_sa_agent ON survey_assignments(assigned_agent_id);
+      CREATE INDEX IF NOT EXISTS idx_srec_type ON survey_records(record_type);
+      CREATE INDEX IF NOT EXISTS idx_cc_phone ON customer_contacts(phone_number);
+    `);
+
+    // Seed default platforms (idempotent). Fixed ids so re-seeding never
+    // collides on the UNIQUE name after a platform is removed from this list.
+    for (const [id, name] of [["plat-1", "Talabat"], ["plat-2", "Keeta"], ["plat-5", "TripAdvisor"],
+      ["plat-6", "Deliveroo"], ["plat-7", "Ordable"], ["plat-8", "Jahez"], ["plat-9", "Snoonu"]]) {
+      await pool.query(
+        "INSERT INTO platforms (id, name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING",
+        [id, name]
+      );
+    }
+    // Remove platforms that were seeded before but are no longer wanted,
+    // only if no rating/survey record references them.
+    await pool.query(`
+      DELETE FROM platforms WHERE name IN ('Google','Instagram')
+        AND NOT EXISTS (SELECT 1 FROM ratings r WHERE r.platform_id = platforms.id)
+        AND NOT EXISTS (SELECT 1 FROM survey_records sr WHERE sr.platform_id = platforms.id)
+    `);
+
+    // Migrations for databases created before newer features
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS can_upload BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS work_type TEXT DEFAULT 'both';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS team TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS department TEXT;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS previous_value TEXT;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS new_value TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS call_reason TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS order_number TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS branch TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS team TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS customer_type TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS call_from TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS aggregator_name TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS comments TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS complaint_reason TEXT;
+      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS fcr TEXT;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS operator_role TEXT;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS category TEXT;
+      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS related_ref TEXT;
+      ALTER TABLE branches ADD COLUMN IF NOT EXISTS brand TEXT;
+      ALTER TABLE logs ADD COLUMN IF NOT EXISTS started_at TEXT;
+      ALTER TABLE logs ADD COLUMN IF NOT EXISTS duration_seconds INTEGER DEFAULT 0;
+      ALTER TABLE logs ADD COLUMN IF NOT EXISTS calls_reviewed INTEGER;
+      ALTER TABLE survey_questions ADD COLUMN IF NOT EXISTS segment TEXT;
+      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS reachability TEXT;
+      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS action_type TEXT DEFAULT 'no_action';
+      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS segment TEXT;
+      ALTER TABLE survey_records ADD COLUMN IF NOT EXISTS segment TEXT;
+      ALTER TABLE logs ADD COLUMN IF NOT EXISTS running_since TEXT;
+      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS duration_seconds INTEGER DEFAULT 0;
+      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS note TEXT;
+      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS template_id TEXT;
+      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS task_date TEXT;
+      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS require_time_entry BOOLEAN DEFAULT true;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS shift_status TEXT DEFAULT 'off';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS shift_started_at TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_assigned_tasks_template_date ON assigned_tasks(template_id, task_date) WHERE template_id IS NOT NULL;
+    `);
+
+    // FM staff are supervised by Quality — move any existing FM accounts there
+    await pool.query(
+      "UPDATE users SET department = 'Quality' WHERE job_title IN ('FM', 'FM Team Leader') AND department IS DISTINCT FROM 'Quality'"
+    );
+
+    // Backfill hierarchy level from the coarse role for legacy accounts
+    await pool.query(`
+      UPDATE users SET level = CASE
+        WHEN role = 'owner' THEN 6
+        WHEN role = 'admin' THEN 99
+        WHEN role = 'manager' THEN 5
+        WHEN role = 'supervisor' THEN 3
+        WHEN role = 'leader' THEN 2
+        ELSE 1 END
+      WHERE level IS NULL
+    `);
+
+    // Replace quality_activity options with the updated list
+    {
+      const newQualityActivities = ["Call Monitoring & Evaluation", "Review Escalated Complaints", "Root Cause Analysis", "SOP & Policy Compliance", "Operational Accuracy", "QA Documentation", "Quality Reporting", "Calibration Management", "Coaching & Performance Follow-up", "Quality Improvement & Special Projects"];
+      const existing = await pool.query<{ label: string }>("SELECT label FROM options WHERE list_key = 'quality_activity'");
+      const existingLabels = existing.rows.map((r) => r.label);
+      const isOldSet = existingLabels.some((l) => ["Call Evaluation", "Order Audit", "Compliance Check", "Calibration Session", "Mystery Shopper"].includes(l));
+      if (isOldSet) {
+        await pool.query("DELETE FROM options WHERE list_key = 'quality_activity'");
+        for (let i = 0; i < newQualityActivities.length; i++) {
+          await pool.query(
+            "INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,'quality_activity',$2,$3,true) ON CONFLICT (id) DO NOTHING",
+            [`opt-quality_activity-${i}`, newQualityActivities[i], i]
+          );
+        }
+      }
+    }
+
+    // Ensure the "Quality" department option exists even on databases whose
+    // department list was seeded before Quality was added
+    await pool.query(
+      "INSERT INTO options (id, list_key, label, sort_order, active) SELECT 'opt-department-quality', 'department', 'Quality', 99, true WHERE NOT EXISTS (SELECT 1 FROM options WHERE list_key = 'department' AND label = 'Quality')"
+    );
+
+    // Backfill teams for rows created before the feature existed
+    await pool.query(
+      "UPDATE users SET team = CASE WHEN role IN ('admin','leader') THEN 'Team Leader' ELSE 'Call Center' END WHERE team IS NULL OR team = ''"
+    );
+    await pool.query(
+      "UPDATE interactions i SET team = u.team FROM users u WHERE i.agent_id = u.id AND (i.team IS NULL OR i.team = '')"
+    );
+    await pool.query("UPDATE interactions SET team = 'Call Center' WHERE team IS NULL OR team = ''");
+
+    // Backfill department from the legacy team value — only for department-scoped
+    // roles. Management roles (manager / owner / admin) are org-wide (no department).
+    await pool.query(`
+      UPDATE users SET department = CASE
+        WHEN team = 'Complain Team' THEN 'Complaints'
+        WHEN team = 'Technical Team' THEN 'Technical'
+        WHEN team = 'Call Center' THEN 'Call Center'
+        ELSE 'Call Center' END
+      WHERE (department IS NULL OR department = '')
+        AND role NOT IN ('manager','owner','admin')
+    `);
+
+    // One-time: install the real company brands + per-brand branches.
+    // Runs once (guarded by the presence of any branded branch), and replaces
+    // the earlier demo brands/branches on existing databases.
+    const branded = await pool.query("SELECT 1 FROM branches WHERE brand IS NOT NULL LIMIT 1");
+    if (branded.rowCount === 0) {
+      await pool.query("DELETE FROM brands WHERE brand_name IN ('Talabat','Noon','Amazon','Carrefour')");
+      await pool.query("DELETE FROM branches WHERE brand IS NULL");
+      for (const b of SEED_BRANDS) {
+        await pool.query("INSERT INTO brands (id, brand_name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING", [b.id, b.brand_name]);
+      }
+      for (const br of SEED_BRANCHES) {
+        await pool.query("INSERT INTO branches (id, branch_name, brand) VALUES ($1,$2,$3) ON CONFLICT (id) DO NOTHING", [br.id, br.branch_name, br.brand ?? null]);
+      }
+    }
+
+    // Rename brands to their full names (match the source review files). Safe:
+    // ratings/logs reference brands by id, so only the display name changes.
+    const brandRenames: [string, string][] = [
+      ["Shakir", "Shawarma Shakir"],
+      ["Yelo", "Yelo Pizza"],
+      ["Pattie", "Pattie Pattie"],
+      ["Chili", "Chili Pepper"],
+      ["Table", "Tabel"],
+    ];
+    for (const [oldName, newName] of brandRenames) {
+      await pool.query(
+        "UPDATE brands SET brand_name = $1 WHERE brand_name = $2 AND NOT EXISTS (SELECT 1 FROM brands WHERE brand_name = $1)",
+        [newName, oldName]
+      );
+    }
+
+    // Seed each dropdown list once (idempotent per list_key, so new lists added
+    // in code get seeded on the next boot without touching existing edits)
+    for (const [key, labels] of Object.entries(DEFAULT_OPTIONS)) {
+      const c = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM options WHERE list_key = $1", [key]);
+      if (Number(c.rows[0].count) === 0) {
+        for (let idx = 0; idx < labels.length; idx++) {
+          await pool.query(
+            "INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,$2,$3,$4,true) ON CONFLICT (id) DO NOTHING",
+            [`opt-${key}-${idx}`, key, labels[idx], idx]
+          );
+        }
+      }
+    }
+
+    const { rows } = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM users");
+    if (Number(rows[0].count) === 0) {
+      await DB.seed();
+    }
+  }
+
+  private static async seed(): Promise<void> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      for (const u of SEED_USERS) {
+        await client.query(
+          `INSERT INTO users (id, full_name, name, username, email, password_hash, role, team, status, created_at, updated_at, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
+          [u.id, u.full_name, u.name, u.username, u.email, u.password_hash, u.role, u.team ?? null, u.status, u.created_at, u.updated_at, u.created_by]
+        );
+      }
+      for (const b of SEED_BRANDS) {
+        await client.query("INSERT INTO brands (id, brand_name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING", [b.id, b.brand_name]);
+      }
+      for (const c of SEED_CATEGORIES) {
+        await client.query("INSERT INTO categories (id, category_name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING", [c.id, c.category_name]);
+      }
+      for (const b of SEED_BRANCHES) {
+        await client.query("INSERT INTO branches (id, branch_name, brand) VALUES ($1,$2,$3) ON CONFLICT (id) DO NOTHING", [b.id, b.branch_name, b.brand ?? null]);
+      }
+      for (const i of SEED_INTERACTIONS) {
+        await client.query(
+          `INSERT INTO interactions (id, interaction_date, interaction_time, agent_id, agent_name, customer_name, customer_phone, interaction_type, communication_type, call_direction, brand, category, call_reason, branch, team, priority, status, summary, action_taken, follow_up_required, follow_up_date, follow_up_notes, attachments, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT (id) DO NOTHING`,
+          [i.id, i.interaction_date, i.interaction_time, i.agent_id, i.agent_name, i.customer_name, i.customer_phone, i.interaction_type, i.communication_type, i.call_direction, i.brand, i.category, i.call_reason ?? null, i.branch ?? null, i.team ?? null, i.priority, i.status, i.summary, i.action_taken, i.follow_up_required, i.follow_up_date ?? null, i.follow_up_notes ?? null, JSON.stringify(i.attachments ?? []), i.created_at]
+        );
+      }
+
+      await client.query("COMMIT");
+      console.log("[CRM DB] Seed data inserted into PostgreSQL.");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // ----------------------------------------------------
+  // User methods
+  // ----------------------------------------------------
+  static async getUsers(): Promise<User[]> {
+    const { rows } = await pool.query<User>("SELECT * FROM users ORDER BY created_at ASC");
+    return rows;
+  }
+
+  static async getUserByEmail(email: string): Promise<User | undefined> {
+    const { rows } = await pool.query<User>("SELECT * FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1", [email]);
+    return rows[0];
+  }
+
+  static async getUserByUsernameOrEmail(identifier: string): Promise<User | undefined> {
+    const { rows } = await pool.query<User>(
+      "SELECT * FROM users WHERE LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1) LIMIT 1",
+      [identifier]
+    );
+    return rows[0];
+  }
+
+  static async getUserById(id: string): Promise<User | undefined> {
+    const { rows } = await pool.query<User>("SELECT * FROM users WHERE id = $1 LIMIT 1", [id]);
+    return rows[0];
+  }
+
+  static async addUser(user: User): Promise<User> {
+    const { rows } = await pool.query<User>(
+      `INSERT INTO users (id, full_name, name, username, email, password_hash, role, level, job_title, team, department, status, created_at, updated_at, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      [user.id, user.full_name, user.name ?? user.full_name, user.username, user.email, user.password_hash, user.role, user.level ?? null, user.job_title ?? null, user.team ?? "Call Center", user.department ?? null, user.status, user.created_at, user.updated_at, user.created_by ?? null]
+    );
+    return rows[0];
+  }
+
+  static async updateUser(id: string, updatedFields: Partial<User>): Promise<User | undefined> {
+    const sets: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    for (const col of USER_UPDATE_COLS) {
+      if (col in updatedFields && (updatedFields as any)[col] !== undefined) {
+        sets.push(`${col} = $${idx++}`);
+        values.push((updatedFields as any)[col]);
+      }
+    }
+    // Keep compat name field in sync when full_name changes
+    if (updatedFields.full_name && !("name" in updatedFields)) {
+      sets.push(`name = $${idx++}`);
+      values.push(updatedFields.full_name);
+    }
+    sets.push(`updated_at = $${idx++}`);
+    values.push(new Date().toISOString());
+
+    values.push(id);
+    const { rows } = await pool.query<User>(
+      `UPDATE users SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    return rows[0];
+  }
+
+  static async deleteUser(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM users WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // ----------------------------------------------------
+  // Audit Logs methods
+  // ----------------------------------------------------
+  static async getAuditLogs(): Promise<AuditLog[]> {
+    const { rows } = await pool.query<AuditLog>("SELECT * FROM audit_logs ORDER BY timestamp DESC");
+    return rows;
+  }
+
+  static async addAuditLog(log: Omit<AuditLog, "id" | "timestamp">): Promise<AuditLog> {
+    const newLog: AuditLog = {
+      ...log,
+      id: "log-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+      timestamp: new Date().toISOString(),
+    };
+    await pool.query(
+      `INSERT INTO audit_logs (id, timestamp, operator_id, operator_name, operator_role, category, action, details, related_ref, ip_address, department, previous_value, new_value)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [newLog.id, newLog.timestamp, newLog.operator_id, newLog.operator_name, newLog.operator_role ?? null, newLog.category ?? null, newLog.action, newLog.details, newLog.related_ref ?? null, newLog.ip_address ?? null, (newLog as any).department ?? null, (newLog as any).previous_value ?? null, (newLog as any).new_value ?? null]
+    );
+    return newLog;
+  }
+
+  // ----------------------------------------------------
+  // Brand methods
+  // ----------------------------------------------------
+  static async getBrands(): Promise<Brand[]> {
+    const { rows } = await pool.query<Brand>("SELECT * FROM brands ORDER BY brand_name ASC");
+    return rows;
+  }
+
+  static async addBrand(name: string): Promise<Brand> {
+    const newBrand: Brand = { id: "brand-" + Date.now(), brand_name: name };
+    await pool.query("INSERT INTO brands (id, brand_name) VALUES ($1,$2)", [newBrand.id, newBrand.brand_name]);
+    return newBrand;
+  }
+
+  static async deleteBrand(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM brands WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // ----------------------------------------------------
+  // Category methods
+  // ----------------------------------------------------
+  static async getCategories(): Promise<Category[]> {
+    const { rows } = await pool.query<Category>("SELECT * FROM categories ORDER BY category_name ASC");
+    return rows;
+  }
+
+  static async addCategory(name: string): Promise<Category> {
+    const newCat: Category = { id: "cat-" + Date.now(), category_name: name };
+    await pool.query("INSERT INTO categories (id, category_name) VALUES ($1,$2)", [newCat.id, newCat.category_name]);
+    return newCat;
+  }
+
+  static async deleteCategory(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM categories WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // ----------------------------------------------------
+  // Branch methods (stores/branches shown for Complaint call reasons)
+  // ----------------------------------------------------
+  static async getBranches(): Promise<Branch[]> {
+    const { rows } = await pool.query<Branch>("SELECT * FROM branches ORDER BY branch_name ASC");
+    return rows;
+  }
+
+  static async addBranch(name: string): Promise<Branch> {
+    const newBranch: Branch = { id: "br-" + Date.now(), branch_name: name };
+    await pool.query("INSERT INTO branches (id, branch_name) VALUES ($1,$2)", [newBranch.id, newBranch.branch_name]);
+    return newBranch;
+  }
+
+  static async deleteBranch(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM branches WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // ----------------------------------------------------
+  // Dropdown options (Configuration page)
+  // ----------------------------------------------------
+  static async getAllOptions(): Promise<DropdownOption[]> {
+    const { rows } = await pool.query<DropdownOption>("SELECT * FROM options ORDER BY list_key ASC, sort_order ASC, label ASC");
+    return rows;
+  }
+
+  static async getOptionsByKey(listKey: string, activeOnly = true): Promise<DropdownOption[]> {
+    const { rows } = await pool.query<DropdownOption>(
+      `SELECT * FROM options WHERE list_key = $1 ${activeOnly ? "AND active = true" : ""} ORDER BY sort_order ASC, label ASC`,
+      [listKey]
+    );
+    return rows;
+  }
+
+  static async addOption(listKey: string, label: string): Promise<DropdownOption> {
+    const m = await pool.query<{ max: number | null }>("SELECT MAX(sort_order) AS max FROM options WHERE list_key = $1", [listKey]);
+    const nextOrder = (m.rows[0].max ?? -1) + 1;
+    const id = "opt-" + Date.now() + "-" + Math.floor(Math.random() * 1000);
+    const { rows } = await pool.query<DropdownOption>(
+      "INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,$2,$3,$4,true) RETURNING *",
+      [id, listKey, label, nextOrder]
+    );
+    return rows[0];
+  }
+
+  static async updateOption(id: string, fields: Partial<Pick<DropdownOption, "label" | "active" | "sort_order">>): Promise<DropdownOption | undefined> {
+    const sets: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    (["label", "active", "sort_order"] as const).forEach((col) => {
+      if (col in fields && (fields as any)[col] !== undefined) {
+        sets.push(`${col} = $${idx++}`);
+        values.push((fields as any)[col]);
+      }
+    });
+    if (sets.length === 0) return undefined;
+    values.push(id);
+    const { rows } = await pool.query<DropdownOption>(`UPDATE options SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    return rows[0];
+  }
+
+  static async deleteOption(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM options WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  static async reorderOptions(listKey: string, orderedIds: string[]): Promise<void> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (let i = 0; i < orderedIds.length; i++) {
+        await client.query("UPDATE options SET sort_order = $1 WHERE id = $2 AND list_key = $3", [i, orderedIds[i], listKey]);
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // ----------------------------------------------------
+  // Operations & Logs (Agent / Team Leader logs)
+  // ----------------------------------------------------
+  static async getLogs(filter: { log_type?: string; department?: string; agent_id?: string; agent_ids?: string[] } = {}): Promise<OpsLog[]> {
+    const clauses: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    if (filter.log_type) { clauses.push(`log_type = $${idx++}`); values.push(filter.log_type); }
+    if (filter.department) { clauses.push(`department = $${idx++}`); values.push(filter.department); }
+    if (filter.agent_id) { clauses.push(`agent_id = $${idx++}`); values.push(filter.agent_id); }
+    if (filter.agent_ids) {
+      if (!filter.agent_ids.length) return []; // scoped to nobody
+      clauses.push(`agent_id = ANY($${idx++})`); values.push(filter.agent_ids);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const { rows } = await pool.query<OpsLog>(`SELECT * FROM logs ${where} ORDER BY created_at DESC`, values);
+    return rows;
+  }
+
+  static async getLogById(id: string): Promise<OpsLog | undefined> {
+    const { rows } = await pool.query<OpsLog>("SELECT * FROM logs WHERE id = $1 LIMIT 1", [id]);
+    return rows[0];
+  }
+
+  static async addLog(log: Omit<OpsLog, "id"> & { id?: string }): Promise<OpsLog> {
+    const id = log.id || "log-" + Date.now() + "-" + Math.floor(Math.random() * 1000);
+    const cols = ["id", ...LOG_COLS];
+    const placeholders = cols.map((_, i) => `$${i + 1}`).join(",");
+    const values = [id, ...LOG_COLS.map((c) => (log as any)[c] ?? null)];
+    const { rows } = await pool.query<OpsLog>(
+      `INSERT INTO logs (${cols.join(",")}) VALUES (${placeholders}) RETURNING *`,
+      values
+    );
+    return rows[0];
+  }
+
+  static async updateLog(id: string, fields: Partial<OpsLog>): Promise<OpsLog | undefined> {
+    const sets: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    for (const col of LOG_UPDATE_COLS) {
+      if (col in fields && (fields as any)[col] !== undefined) {
+        sets.push(`${col} = $${idx++}`);
+        values.push((fields as any)[col]);
+      }
+    }
+    sets.push(`updated_at = $${idx++}`);
+    values.push(new Date().toISOString());
+    if (sets.length === 1) return DB.getLogById(id); // only updated_at → nothing to change
+    values.push(id);
+    const { rows } = await pool.query<OpsLog>(`UPDATE logs SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    return rows[0];
+  }
+
+  static async deleteLog(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM logs WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // Live task timer: start / pause / complete (accumulates active seconds)
+  static async controlTimer(id: string, action: "start" | "pause" | "complete", completeStatus: string): Promise<OpsLog | undefined> {
+    const log = await DB.getLogById(id);
+    if (!log) return undefined;
+    const now = new Date();
+    const nowIso = now.toISOString();
+    let duration = Number((log as any).duration_seconds || 0);
+    let running_since: string | null = (log as any).running_since || null;
+    let started_at: string | null = (log as any).started_at || null;
+    let status = log.status;
+
+    const flush = () => {
+      if (running_since) {
+        duration += Math.max(0, Math.round((now.getTime() - new Date(running_since).getTime()) / 1000));
+        running_since = null;
+      }
+    };
+
+    if (action === "start") {
+      if (!running_since) running_since = nowIso;
+      if (!started_at) started_at = nowIso;
+      if (!["Completed", "Solved", "Closed"].includes(status || "")) status = "In Progress";
+    } else if (action === "pause") {
+      flush();
+    } else if (action === "complete") {
+      flush();
+      status = completeStatus;
+    }
+
+    const { rows } = await pool.query<OpsLog>(
+      "UPDATE logs SET duration_seconds = $1, running_since = $2, started_at = $3, status = $4, updated_at = $5 WHERE id = $6 RETURNING *",
+      [duration, running_since, started_at, status, nowIso, id]
+    );
+    return rows[0];
+  }
+
+  // ----------------------------------------------------
+  // Assigned tasks (manager -> agent)
+  // ----------------------------------------------------
+  static async getAssignedTasks(filter: { assigned_to?: string; department?: string } = {}): Promise<AssignedTask[]> {
+    const clauses: string[] = ["status != 'Cancelled'"];
+    const values: any[] = [];
+    let idx = 1;
+    if (filter.assigned_to) { clauses.push(`assigned_to = $${idx++}`); values.push(filter.assigned_to); }
+    if (filter.department) { clauses.push(`department = $${idx++}`); values.push(filter.department); }
+    const where = `WHERE ${clauses.join(" AND ")}`;
+    const { rows } = await pool.query<AssignedTask>(`SELECT * FROM assigned_tasks ${where} ORDER BY created_at DESC`, values);
+    return rows;
+  }
+
+  static async getAssignedTaskById(id: string): Promise<AssignedTask | undefined> {
+    const { rows } = await pool.query<AssignedTask>("SELECT * FROM assigned_tasks WHERE id = $1 LIMIT 1", [id]);
+    return rows[0];
+  }
+
+  static async addAssignedTask(t: AssignedTask): Promise<AssignedTask> {
+    const { rows } = await pool.query<AssignedTask>(
+      `INSERT INTO assigned_tasks (id, title, description, assigned_by, assigned_by_name, assigned_to, assigned_to_name, department, priority, due_date, status, seen, require_time_entry, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13,$13) RETURNING *`,
+      [t.id, t.title, t.description ?? null, t.assigned_by, t.assigned_by_name, t.assigned_to, t.assigned_to_name, t.department ?? null, t.priority ?? null, t.due_date ?? null, t.status || "New", (t as any).require_time_entry !== false, t.created_at]
+    );
+    return rows[0];
+  }
+
+  static async updateAssignedTask(id: string, fields: Partial<AssignedTask>): Promise<AssignedTask | undefined> {
+    const cols = ["title", "description", "priority", "due_date", "status", "seen", "completed_at", "assigned_to", "assigned_to_name", "department", "duration_seconds", "note", "require_time_entry"] as const;
+    const sets: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    for (const c of cols) {
+      if (c in fields && (fields as any)[c] !== undefined) { sets.push(`${c} = $${idx++}`); values.push((fields as any)[c]); }
+    }
+    sets.push(`updated_at = $${idx++}`);
+    values.push(new Date().toISOString());
+    if (sets.length === 1) return DB.getAssignedTaskById(id);
+    values.push(id);
+    const { rows } = await pool.query<AssignedTask>(`UPDATE assigned_tasks SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    return rows[0];
+  }
+
+  static async countUnseenTasks(assignedTo: string): Promise<number> {
+    const { rows } = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM assigned_tasks WHERE assigned_to = $1 AND seen = false", [assignedTo]);
+    return Number(rows[0].count);
+  }
+
+  static async markTasksSeen(assignedTo: string): Promise<void> {
+    await pool.query("UPDATE assigned_tasks SET seen = true WHERE assigned_to = $1 AND seen = false", [assignedTo]);
+  }
+
+  static async deleteAssignedTask(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM assigned_tasks WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // ----------------------------------------------------
+  // Recurring task templates
+  // ----------------------------------------------------
+  static async getRecurringTemplates(filter: { department?: string } = {}): Promise<any[]> {
+    const where = filter.department ? "WHERE department = $1" : "";
+    const values = filter.department ? [filter.department] : [];
+    const { rows } = await pool.query(`SELECT * FROM recurring_templates ${where} ORDER BY created_at DESC`, values);
+    return rows;
+  }
+  static async getRecurringTemplateById(id: string): Promise<any | undefined> {
+    const { rows } = await pool.query("SELECT * FROM recurring_templates WHERE id = $1 LIMIT 1", [id]);
+    return rows[0];
+  }
+  static async addRecurringTemplate(t: any): Promise<any> {
+    const { rows } = await pool.query(
+      `INSERT INTO recurring_templates (id, title, description, department, priority, recurrence_type, days_of_week, due_time, assign_mode, active, created_by, created_by_name, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [t.id, t.title, t.description ?? null, t.department ?? null, t.priority ?? "Medium", t.recurrence_type ?? "daily", t.days_of_week ?? null, t.due_time ?? null, t.assign_mode ?? "pool", t.active ?? true, t.created_by ?? null, t.created_by_name ?? null, t.created_at]
+    );
+    return rows[0];
+  }
+  static async updateRecurringTemplate(id: string, fields: any): Promise<any | undefined> {
+    const cols = ["title", "description", "department", "priority", "recurrence_type", "days_of_week", "due_time", "assign_mode", "active"];
+    const sets: string[] = []; const values: any[] = []; let idx = 1;
+    for (const c of cols) { if (c in fields && fields[c] !== undefined) { sets.push(`${c} = $${idx++}`); values.push(fields[c]); } }
+    if (!sets.length) return DB.getRecurringTemplateById(id);
+    values.push(id);
+    const { rows } = await pool.query(`UPDATE recurring_templates SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    return rows[0];
+  }
+  static async deleteRecurringTemplate(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM recurring_templates WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // Insert a generated recurring instance; idempotent on (template_id, task_date)
+  static async addRecurringInstance(t: AssignedTask & { template_id: string; task_date: string }): Promise<AssignedTask | undefined> {
+    const { rows } = await pool.query<AssignedTask>(
+      `INSERT INTO assigned_tasks (id, title, description, assigned_by, assigned_by_name, assigned_to, assigned_to_name, department, priority, due_date, status, seen, template_id, task_date, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13,$14,$14)
+       ON CONFLICT (template_id, task_date) WHERE template_id IS NOT NULL DO NOTHING RETURNING *`,
+      [t.id, t.title, t.description ?? null, t.assigned_by, t.assigned_by_name, t.assigned_to ?? null, t.assigned_to_name ?? null, t.department ?? null, t.priority ?? null, t.due_date ?? null, t.status || "Available", t.template_id, t.task_date, t.created_at]
+    );
+    return rows[0];
+  }
+  static async recurringInstanceExists(templateId: string, taskDate: string): Promise<boolean> {
+    const { rows } = await pool.query("SELECT 1 FROM assigned_tasks WHERE template_id = $1 AND task_date = $2 LIMIT 1", [templateId, taskDate]);
+    return rows.length > 0;
+  }
+
+  // Pool: unclaimed available tasks for a department
+  static async getPoolTasks(department: string): Promise<AssignedTask[]> {
+    const { rows } = await pool.query<AssignedTask>(
+      "SELECT * FROM assigned_tasks WHERE department = $1 AND assigned_to IS NULL AND status = 'Available' ORDER BY due_date ASC NULLS LAST, created_at ASC",
+      [department]
+    );
+    return rows;
+  }
+  // Claim a pool task atomically (returns the task if claim succeeded)
+  static async claimTask(id: string, userId: string, userName: string): Promise<AssignedTask | undefined> {
+    const { rows } = await pool.query<AssignedTask>(
+      "UPDATE assigned_tasks SET assigned_to = $2, assigned_to_name = $3, status = 'New', seen = true, updated_at = $4 WHERE id = $1 AND assigned_to IS NULL RETURNING *",
+      [id, userId, userName, new Date().toISOString()]
+    );
+    return rows[0];
+  }
+  // Count active (non-completed) tasks per agent — for round-robin auto-assign
+  static async getOpenTaskCounts(department: string): Promise<Record<string, number>> {
+    const { rows } = await pool.query<{ assigned_to: string; c: string }>(
+      "SELECT assigned_to, COUNT(*)::int AS c FROM assigned_tasks WHERE department = $1 AND assigned_to IS NOT NULL AND status <> 'Completed' GROUP BY assigned_to",
+      [department]
+    );
+    const map: Record<string, number> = {};
+    rows.forEach((r) => { map[r.assigned_to] = Number(r.c); });
+    return map;
+  }
+
+  // ----------------------------------------------------
+  // Shift presence
+  // ----------------------------------------------------
+  static async getOnShiftAgents(department: string): Promise<{ id: string; full_name: string }[]> {
+    const { rows } = await pool.query<{ id: string; full_name: string }>(
+      "SELECT id, full_name FROM users WHERE role = 'agent' AND status = 'Active' AND shift_status = 'on' AND department = $1",
+      [department]
+    );
+    return rows;
+  }
+  static async setShiftStatus(userId: string, status: "on" | "off", startedAt: string | null): Promise<void> {
+    await pool.query("UPDATE users SET shift_status = $2, shift_started_at = $3 WHERE id = $1", [userId, status, startedAt]);
+  }
+  static async startShiftSession(s: { id: string; user_id: string; user_name: string; department: string; started_at: string }): Promise<void> {
+    await pool.query(
+      "INSERT INTO shift_sessions (id, user_id, user_name, department, started_at) VALUES ($1,$2,$3,$4,$5)",
+      [s.id, s.user_id, s.user_name, s.department, s.started_at]
+    );
+  }
+  static async endShiftSession(userId: string, endedAt: string): Promise<void> {
+    const { rows } = await pool.query<{ id: string; started_at: string }>(
+      "SELECT id, started_at FROM shift_sessions WHERE user_id = $1 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+      [userId]
+    );
+    if (!rows.length) return;
+    const dur = Math.max(0, Math.round((new Date(endedAt).getTime() - new Date(rows[0].started_at).getTime()) / 1000));
+    await pool.query("UPDATE shift_sessions SET ended_at = $2, duration_seconds = $3 WHERE id = $1", [rows[0].id, endedAt, dur]);
+  }
+  static async getShiftSessions(filter: { department?: string; user_id?: string } = {}): Promise<any[]> {
+    const clauses: string[] = []; const values: any[] = []; let idx = 1;
+    if (filter.department) { clauses.push(`department = $${idx++}`); values.push(filter.department); }
+    if (filter.user_id) { clauses.push(`user_id = $${idx++}`); values.push(filter.user_id); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const { rows } = await pool.query(`SELECT * FROM shift_sessions ${where} ORDER BY started_at DESC LIMIT 500`, values);
+    return rows;
+  }
+
+  // ----------------------------------------------------
+  // Interaction methods
+  // ----------------------------------------------------
+  static async getInteractions(): Promise<Interaction[]> {
+    const { rows } = await pool.query<Interaction>("SELECT * FROM interactions ORDER BY created_at DESC");
+    return rows;
+  }
+
+  static async getInteractionById(id: string): Promise<Interaction | undefined> {
+    const { rows } = await pool.query<Interaction>("SELECT * FROM interactions WHERE id = $1 LIMIT 1", [id]);
+    return rows[0];
+  }
+
+  // History lookup for the Call Reason screen (by customer phone and/or order number)
+  static async getInteractionHistory(opts: { phone?: string; order?: string }): Promise<Interaction[]> {
+    const clauses: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    if (opts.phone) {
+      clauses.push(`customer_phone = $${idx++}`);
+      values.push(opts.phone);
+    }
+    if (opts.order) {
+      clauses.push(`order_number = $${idx++}`);
+      values.push(opts.order);
+    }
+    if (clauses.length === 0) return [];
+    const { rows } = await pool.query<Interaction>(
+      `SELECT * FROM interactions WHERE ${clauses.join(" OR ")} ORDER BY created_at DESC LIMIT 50`,
+      values
+    );
+    return rows;
+  }
+
+  static async addInteraction(interaction: Omit<Interaction, "id"> & { id?: string }): Promise<Interaction> {
+    const id = interaction.id || "int-" + Date.now();
+    const { rows } = await pool.query<Interaction>(
+      `INSERT INTO interactions (id, interaction_date, interaction_time, agent_id, agent_name, customer_name, customer_phone, interaction_type, communication_type, call_direction, brand, category, call_reason, order_number, branch, team, customer_type, call_from, aggregator_name, comments, complaint_reason, fcr, priority, status, summary, action_taken, follow_up_required, follow_up_date, follow_up_notes, attachments, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31) RETURNING *`,
+      [id, interaction.interaction_date, interaction.interaction_time, interaction.agent_id, interaction.agent_name, interaction.customer_name, interaction.customer_phone, interaction.interaction_type, interaction.communication_type, interaction.call_direction, interaction.brand, interaction.category, interaction.call_reason ?? null, interaction.order_number ?? null, interaction.branch ?? null, interaction.team ?? null, interaction.customer_type ?? null, interaction.call_from ?? null, interaction.aggregator_name ?? null, interaction.comments ?? null, interaction.complaint_reason ?? null, interaction.fcr ?? null, interaction.priority, interaction.status, interaction.summary, interaction.action_taken, interaction.follow_up_required, interaction.follow_up_date ?? null, interaction.follow_up_notes ?? null, JSON.stringify(interaction.attachments ?? []), interaction.created_at]
+    );
+    return rows[0];
+  }
+
+  static async updateInteraction(id: string, updatedFields: Partial<Interaction>): Promise<Interaction | undefined> {
+    const sets: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    for (const col of INTERACTION_UPDATE_COLS) {
+      if (col in updatedFields && (updatedFields as any)[col] !== undefined) {
+        sets.push(`${col} = $${idx++}`);
+        const raw = (updatedFields as any)[col];
+        values.push(col === "attachments" ? JSON.stringify(raw ?? []) : raw);
+      }
+    }
+
+    if (sets.length === 0) {
+      return DB.getInteractionById(id);
+    }
+
+    values.push(id);
+    const { rows } = await pool.query<Interaction>(
+      `UPDATE interactions SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    return rows[0];
+  }
+
+  static async deleteInteraction(id: string): Promise<boolean> {
+    const res = await pool.query("DELETE FROM interactions WHERE id = $1", [id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // ----------------------------------------------------
+  // Platforms
+  // ----------------------------------------------------
+  static async getPlatforms(): Promise<{ id: string; name: string }[]> {
+    const { rows } = await pool.query("SELECT * FROM platforms ORDER BY name ASC");
+    return rows;
+  }
+
+  // ----------------------------------------------------
+  // Ratings / Reviews
+  // ----------------------------------------------------
+  static async getRatings(filter: {
+    brand_id?: string; platform_id?: string; action_status?: string;
+    requires_action?: boolean; assigned?: string; assigned_agent_id?: string;
+    min_rating?: number; max_rating?: number; has_comment?: boolean;
+    from?: string; to?: string; limit?: number; offset?: number;
+  } = {}): Promise<any[]> {
+    const clauses: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    if (filter.brand_id) { clauses.push(`r.brand_id = $${idx++}`); values.push(filter.brand_id); }
+    if (filter.platform_id) { clauses.push(`r.platform_id = $${idx++}`); values.push(filter.platform_id); }
+    if (filter.action_status) { clauses.push(`r.action_status = $${idx++}`); values.push(filter.action_status); }
+    // Auto-closed rows are report-only — they must never surface in the Reviews list for any role.
+    clauses.push(`r.action_status <> 'no_action_needed'`);
+    if (filter.requires_action === true) { clauses.push(`r.requires_action = true`); }
+    if (filter.assigned === "me" && filter.assigned_agent_id) { clauses.push(`r.assigned_agent_id = $${idx++}`); values.push(filter.assigned_agent_id); }
+    else if (filter.assigned === "unassigned") { clauses.push(`r.assigned_agent_id IS NULL`); }
+    else if (filter.assigned_agent_id) { clauses.push(`r.assigned_agent_id = $${idx++}`); values.push(filter.assigned_agent_id); }
+    if (filter.min_rating != null) { clauses.push(`r.rating >= $${idx++}`); values.push(filter.min_rating); }
+    if (filter.max_rating != null) { clauses.push(`r.rating <= $${idx++}`); values.push(filter.max_rating); }
+    if (filter.has_comment === true) { clauses.push(`(r.review_text IS NOT NULL AND btrim(r.review_text) <> '')`); }
+    else if (filter.has_comment === false) { clauses.push(`(r.review_text IS NULL OR btrim(r.review_text) = '')`); }
+    // Filter on the review's own date (order_date, normalised to YYYY-MM-DD on
+    // upload), not uploaded_at — a whole batch shares one upload timestamp, so
+    // filtering by that would be useless for narrowing down reviews.
+    if (filter.from) { clauses.push(`r.order_date >= $${idx++}`); values.push(filter.from); }
+    if (filter.to) { clauses.push(`r.order_date <= $${idx++}`); values.push(filter.to); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const lim = filter.limit || 100;
+    const off = filter.offset || 0;
+    const { rows } = await pool.query(`
+      SELECT r.*,
+        b.brand_name, p.name AS platform_name,
+        ua.full_name AS agent_name,
+        uu.full_name AS uploaded_by_name,
+        ur.full_name AS recorded_by_name
+      FROM ratings r
+      LEFT JOIN brands b ON b.id = r.brand_id
+      LEFT JOIN platforms p ON p.id = r.platform_id
+      LEFT JOIN users ua ON ua.id = r.assigned_agent_id
+      LEFT JOIN users uu ON uu.id = r.uploaded_by
+      LEFT JOIN users ur ON ur.id = r.recorded_by
+      ${where}
+      ORDER BY r.uploaded_at DESC
+      LIMIT $${idx++} OFFSET $${idx++}
+    `, [...values, lim, off]);
+    return rows;
+  }
+
+  static async getRatingById(id: string): Promise<any | undefined> {
+    const { rows } = await pool.query(`
+      SELECT r.*,
+        b.brand_name, p.name AS platform_name,
+        ua.full_name AS agent_name,
+        uu.full_name AS uploaded_by_name,
+        ur.full_name AS recorded_by_name
+      FROM ratings r
+      LEFT JOIN brands b ON b.id = r.brand_id
+      LEFT JOIN platforms p ON p.id = r.platform_id
+      LEFT JOIN users ua ON ua.id = r.assigned_agent_id
+      LEFT JOIN users uu ON uu.id = r.uploaded_by
+      LEFT JOIN users ur ON ur.id = r.recorded_by
+      WHERE r.id = $1 LIMIT 1
+    `, [id]);
+    if (!rows[0]) return undefined;
+    const attempts = await pool.query(`
+      SELECT a.*, u.full_name AS agent_name FROM rating_call_attempts a
+      LEFT JOIN users u ON u.id = a.agent_id
+      WHERE a.rating_id = $1 ORDER BY a.attempt_number ASC
+    `, [id]);
+    return { ...rows[0], attempts: attempts.rows };
+  }
+
+  static async upsertRating(data: {
+    brand_id: string; platform_id: string; order_id: string; rating: number;
+    review_text?: string; customer_phone?: string; requires_action: boolean;
+    action_status: string; uploaded_by: string;
+    order_date?: string; customer_name?: string; branch?: string;
+    filled_by?: string; following_date?: string; surveyed_by?: string;
+    complaint_type?: string; complaint_cases?: string; complaint_status?: string;
+    served_by?: string; note?: string; assigned_agent_id?: string | null;
+  }, mode: "skip" | "overwrite"): Promise<"inserted" | "skipped" | "overwritten"> {
+    const id = "rat-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+    if (mode === "skip") {
+      const res = await pool.query(`
+        INSERT INTO ratings (id,brand_id,platform_id,order_id,rating,review_text,customer_phone,requires_action,action_status,uploaded_by,uploaded_at,order_date,customer_name,branch,filled_by,following_date,surveyed_by,complaint_type,complaint_cases,complaint_status,served_by,note,assigned_agent_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+        ON CONFLICT (brand_id,platform_id,order_id) DO NOTHING
+      `, [id,data.brand_id,data.platform_id,data.order_id,data.rating,data.review_text||null,data.customer_phone||null,data.requires_action,data.action_status,data.uploaded_by,data.order_date||null,data.customer_name||null,data.branch||null,data.filled_by||null,data.following_date||null,data.surveyed_by||null,data.complaint_type||null,data.complaint_cases||null,data.complaint_status||null,data.served_by||null,data.note||null,data.assigned_agent_id??null]);
+      return (res.rowCount ?? 0) > 0 ? "inserted" : "skipped";
+    } else {
+      const res = await pool.query(`
+        INSERT INTO ratings (id,brand_id,platform_id,order_id,rating,review_text,customer_phone,requires_action,action_status,uploaded_by,uploaded_at,order_date,customer_name,branch,filled_by,following_date,surveyed_by,complaint_type,complaint_cases,complaint_status,served_by,note,assigned_agent_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+        ON CONFLICT (brand_id,platform_id,order_id) DO UPDATE SET
+          rating=EXCLUDED.rating,review_text=EXCLUDED.review_text,customer_phone=EXCLUDED.customer_phone,
+          requires_action=EXCLUDED.requires_action,action_status=EXCLUDED.action_status,
+          uploaded_by=EXCLUDED.uploaded_by,uploaded_at=now(),
+          order_date=EXCLUDED.order_date,customer_name=EXCLUDED.customer_name,branch=EXCLUDED.branch,
+          filled_by=EXCLUDED.filled_by,following_date=EXCLUDED.following_date,surveyed_by=EXCLUDED.surveyed_by,
+          complaint_type=EXCLUDED.complaint_type,complaint_cases=EXCLUDED.complaint_cases,
+          complaint_status=EXCLUDED.complaint_status,served_by=EXCLUDED.served_by,note=EXCLUDED.note
+        RETURNING (xmax = 0) AS inserted
+      `, [id,data.brand_id,data.platform_id,data.order_id,data.rating,data.review_text||null,data.customer_phone||null,data.requires_action,data.action_status,data.uploaded_by,data.order_date||null,data.customer_name||null,data.branch||null,data.filled_by||null,data.following_date||null,data.surveyed_by||null,data.complaint_type||null,data.complaint_cases||null,data.complaint_status||null,data.served_by||null,data.note||null,data.assigned_agent_id??null]);
+      return res.rows[0]?.inserted ? "inserted" : "overwritten";
+    }
+  }
+
+  static async updateRating(id: string, fields: {
+    action_status?: string; action_note?: string; assigned_agent_id?: string | null;
+    resolved_at?: string | null; recorded_by?: string | null; recorded_at?: string | null;
+    customer_phone?: string | null; customer_name?: string | null;
+  }): Promise<any | undefined> {
+    const cols = ["action_status","action_note","assigned_agent_id","resolved_at","recorded_by","recorded_at","customer_phone","customer_name"] as const;
+    const sets: string[] = []; const values: any[] = []; let idx = 1;
+    for (const c of cols) {
+      if (c in fields) { sets.push(`${c} = $${idx++}`); values.push((fields as any)[c]); }
+    }
+    if (!sets.length) return DB.getRatingById(id);
+    values.push(id);
+    await pool.query(`UPDATE ratings SET ${sets.join(",")} WHERE id = $${idx}`, values);
+    return DB.getRatingById(id);
+  }
+
+  static async bulkAssignRatings(ids: string[], agentId: string | null): Promise<number> {
+    if (!ids.length) return 0;
+    const res = await pool.query("UPDATE ratings SET assigned_agent_id = $1 WHERE id = ANY($2)", [agentId, ids]);
+    return res.rowCount ?? 0;
+  }
+
+  static async bulkSetRatingStatus(ids: string[], actionStatus: string): Promise<number> {
+    if (!ids.length) return 0;
+    const closingStatuses = ["resolved", "no_action_needed", "unreachable"];
+    const res = await pool.query(
+      closingStatuses.includes(actionStatus)
+        ? `UPDATE ratings SET action_status = $1, resolved_at = COALESCE(resolved_at, now()) WHERE id = ANY($2)`
+        : `UPDATE ratings SET action_status = $1 WHERE id = ANY($2)`,
+      [actionStatus, ids]
+    );
+    return res.rowCount ?? 0;
+  }
+
+  static async deleteRatings(ids: string[]): Promise<number> {
+    if (!ids.length) return 0;
+    const res = await pool.query("DELETE FROM ratings WHERE id = ANY($1)", [ids]);
+    return res.rowCount ?? 0;
+  }
+
+  static async countRatingsUploadedBetween(fromISO: string, toISO: string): Promise<number> {
+    const { rows } = await pool.query<{ c: string }>(
+      "SELECT COUNT(*)::int AS c FROM ratings WHERE uploaded_at >= $1 AND uploaded_at <= $2", [fromISO, toISO]);
+    return Number(rows[0]?.c || 0);
+  }
+
+  static async deleteRatingsUploadedBetween(fromISO: string, toISO: string): Promise<number> {
+    const res = await pool.query(
+      "DELETE FROM ratings WHERE uploaded_at >= $1 AND uploaded_at <= $2", [fromISO, toISO]);
+    return res.rowCount ?? 0;
+  }
+
+  static async addCallAttempt(data: {
+    rating_id: string; agent_id: string; agent_name: string; outcome: string; note?: string;
+  }): Promise<any> {
+    const cnt = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM rating_call_attempts WHERE rating_id = $1", [data.rating_id]);
+    const n = Number(cnt.rows[0].count) + 1;
+    const id = "att-" + Date.now() + "-" + Math.floor(Math.random() * 999);
+    const { rows } = await pool.query(`
+      INSERT INTO rating_call_attempts (id,rating_id,agent_id,agent_name,attempt_number,outcome,note,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING *
+    `, [id, data.rating_id, data.agent_id, data.agent_name, n, data.outcome, data.note || null]);
+    return rows[0];
+  }
+
+  // ----------------------------------------------------
+  // Surveys — Templates
+  // ----------------------------------------------------
+  static async getSurveyTemplates(): Promise<any[]> {
+    const { rows } = await pool.query(`
+      SELECT t.*, b.brand_name, u.full_name AS created_by_name,
+        (SELECT COUNT(*)::int FROM survey_questions q WHERE q.template_id = t.id) AS question_count
+      FROM survey_templates t
+      LEFT JOIN brands b ON b.id = t.brand_id
+      LEFT JOIN users u ON u.id = t.created_by
+      ORDER BY t.created_at DESC
+    `);
+    return rows;
+  }
+
+  static async getSurveyTemplateById(id: string): Promise<any | undefined> {
+    const { rows } = await pool.query(`
+      SELECT t.*, b.brand_name, u.full_name AS created_by_name
+      FROM survey_templates t
+      LEFT JOIN brands b ON b.id = t.brand_id
+      LEFT JOIN users u ON u.id = t.created_by
+      WHERE t.id = $1 LIMIT 1
+    `, [id]);
+    if (!rows[0]) return undefined;
+    const q = await pool.query("SELECT * FROM survey_questions WHERE template_id = $1 ORDER BY q_order ASC", [id]);
+    return { ...rows[0], questions: q.rows };
+  }
+
+  static async createSurveyTemplate(data: {
+    name: string; brand_id?: string | null; created_by: string; active?: boolean;
+    questions: { text: string; answer_type: string; options?: any; q_order?: number; segment?: string | null }[];
+  }): Promise<any> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const id = "st-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+      await client.query(
+        "INSERT INTO survey_templates (id,name,brand_id,created_by,active,created_at) VALUES ($1,$2,$3,$4,$5,now())",
+        [id, data.name, data.brand_id || null, data.created_by, data.active !== false]
+      );
+      for (let i = 0; i < data.questions.length; i++) {
+        const q = data.questions[i];
+        const qid = "sq-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
+        await client.query(
+          "INSERT INTO survey_questions (id,template_id,text,answer_type,options,q_order,segment) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+          [qid, id, q.text, q.answer_type || "free_text", q.options ? JSON.stringify(q.options) : null, q.q_order ?? i, q.segment || null]
+        );
+      }
+      await client.query("COMMIT");
+      return DB.getSurveyTemplateById(id);
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  static async updateSurveyTemplate(id: string, data: {
+    name?: string; brand_id?: string | null; active?: boolean;
+    questions?: { text: string; answer_type: string; options?: any; q_order?: number; segment?: string | null }[];
+  }): Promise<any | undefined> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const sets: string[] = []; const vals: any[] = []; let idx = 1;
+      if (data.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(data.name); }
+      if (data.brand_id !== undefined) { sets.push(`brand_id = $${idx++}`); vals.push(data.brand_id || null); }
+      if (data.active !== undefined) { sets.push(`active = $${idx++}`); vals.push(data.active); }
+      if (sets.length) { vals.push(id); await client.query(`UPDATE survey_templates SET ${sets.join(",")} WHERE id = $${idx}`, vals); }
+      if (data.questions) {
+        await client.query("DELETE FROM survey_questions WHERE template_id = $1", [id]);
+        for (let i = 0; i < data.questions.length; i++) {
+          const q = data.questions[i];
+          const qid = "sq-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
+          await client.query(
+            "INSERT INTO survey_questions (id,template_id,text,answer_type,options,q_order,segment) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            [qid, id, q.text, q.answer_type || "free_text", q.options ? JSON.stringify(q.options) : null, q.q_order ?? i, q.segment || null]
+          );
+        }
+      }
+      await client.query("COMMIT");
+      return DB.getSurveyTemplateById(id);
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // ----------------------------------------------------
+  // Surveys — Campaigns
+  // ----------------------------------------------------
+  static async getSurveyCampaigns(): Promise<any[]> {
+    const { rows } = await pool.query(`
+      SELECT c.*, b.brand_name, t.name AS template_name, u.full_name AS requested_by_name,
+        da.full_name AS default_agent_name,
+        (SELECT COUNT(*)::int FROM survey_assignments a WHERE a.campaign_id = c.id) AS total_numbers,
+        (SELECT COUNT(*)::int FROM survey_assignments a WHERE a.campaign_id = c.id AND a.status = 'successful') AS done_numbers
+      FROM survey_campaigns c
+      LEFT JOIN brands b ON b.id = c.brand_id
+      LEFT JOIN survey_templates t ON t.id = c.template_id
+      LEFT JOIN users u ON u.id = c.requested_by
+      LEFT JOIN users da ON da.id = c.default_agent_id
+      ORDER BY c.created_at DESC
+    `);
+    return rows;
+  }
+
+  static async getSurveyCampaignById(id: string): Promise<any | undefined> {
+    const { rows } = await pool.query(`
+      SELECT c.*, b.brand_name, t.name AS template_name, u.full_name AS requested_by_name,
+        da.full_name AS default_agent_name
+      FROM survey_campaigns c
+      LEFT JOIN brands b ON b.id = c.brand_id
+      LEFT JOIN survey_templates t ON t.id = c.template_id
+      LEFT JOIN users u ON u.id = c.requested_by
+      LEFT JOIN users da ON da.id = c.default_agent_id
+      WHERE c.id = $1 LIMIT 1
+    `, [id]);
+    return rows[0];
+  }
+
+  static async createSurveyCampaign(data: {
+    brand_id?: string | null; requested_by: string; requester_role?: string;
+    template_id?: string | null; survey_type: string; assignment_mode: string;
+    continuity_type: string; requested_count: number; duration_days: number;
+    default_agent_id?: string | null;
+  }): Promise<any> {
+    const id = "sc-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+    await pool.query(`
+      INSERT INTO survey_campaigns (id,brand_id,requested_by,requester_role,template_id,survey_type,assignment_mode,continuity_type,requested_count,duration_days,status,default_agent_id,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,now())
+    `, [id, data.brand_id || null, data.requested_by, data.requester_role || null, data.template_id || null, data.survey_type, data.assignment_mode, data.continuity_type, data.requested_count, data.duration_days, data.default_agent_id || null]);
+    return DB.getSurveyCampaignById(id);
+  }
+
+  static async setSurveyCampaignStatus(id: string, status: string): Promise<any | undefined> {
+    await pool.query("UPDATE survey_campaigns SET status = $1 WHERE id = $2", [status, id]);
+    return DB.getSurveyCampaignById(id);
+  }
+
+  // ----------------------------------------------------
+  // Surveys — Numbers / dedup / capacity
+  // ----------------------------------------------------
+  static async wasRecentlyContacted(brandId: string | null, phone: string, days: number): Promise<boolean> {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM customer_contacts WHERE phone_number = $1 AND ($2::text IS NULL OR brand_id = $2)
+         AND last_contacted_at > now() - ($3 || ' days')::interval LIMIT 1`,
+      [phone, brandId, String(days)]
+    );
+    return rows.length > 0;
+  }
+
+  static async isPhoneQueued(brandId: string | null, phone: string): Promise<boolean> {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM survey_assignments WHERE customer_phone = $1 AND ($2::text IS NULL OR brand_id = $2)
+         AND status IN ('pending','in_progress') LIMIT 1`,
+      [phone, brandId]
+    );
+    return rows.length > 0;
+  }
+
+  // Current pending counts per scheduled_date from today forward
+  static async getPendingCountsByDate(): Promise<Map<string, number>> {
+    const { rows } = await pool.query<{ d: string; c: string }>(
+      `SELECT to_char(scheduled_date,'YYYY-MM-DD') AS d, COUNT(*)::int AS c
+       FROM survey_assignments WHERE status = 'pending' AND scheduled_date >= CURRENT_DATE
+       GROUP BY scheduled_date`
+    );
+    const m = new Map<string, number>();
+    for (const r of rows) m.set(r.d, Number(r.c));
+    return m;
+  }
+
+  static async addSurveyAssignments(rows: { campaign_id: string; brand_id: string | null; customer_phone: string; assigned_agent_id: string | null; scheduled_date: string; segment?: string | null }[]): Promise<number> {
+    if (!rows.length) return 0;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (let i = 0; i < rows.length; i++) {
+        const a = rows[i];
+        const id = "sasg-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
+        await client.query(
+          `INSERT INTO survey_assignments (id,campaign_id,brand_id,customer_phone,assigned_agent_id,attempt_count,status,scheduled_date,segment,created_at)
+           VALUES ($1,$2,$3,$4,$5,0,'pending',$6,$7,now())`,
+          [id, a.campaign_id, a.brand_id, a.customer_phone, a.assigned_agent_id, a.scheduled_date, a.segment || null]
+        );
+      }
+      await client.query("COMMIT");
+      return rows.length;
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  static async getToday(): Promise<string> {
+    const { rows } = await pool.query<{ d: string }>("SELECT to_char(CURRENT_DATE,'YYYY-MM-DD') AS d");
+    return rows[0].d;
+  }
+
+  static async getDailyCapacity(days: number, limit: number): Promise<{ date: string; used: number; limit: number }[]> {
+    const counts = await DB.getPendingCountsByDate();
+    const { rows } = await pool.query<{ d: string }>(
+      `SELECT to_char(CURRENT_DATE + g, 'YYYY-MM-DD') AS d FROM generate_series(0, $1) g`,
+      [days - 1]
+    );
+    return rows.map((r) => ({ date: r.d, used: counts.get(r.d) || 0, limit }));
+  }
+
+  // ----------------------------------------------------
+  // Surveys — Queue / assignments / attempts / responses
+  // ----------------------------------------------------
+  static async getSurveyQueue(userId: string): Promise<any[]> {
+    const { rows } = await pool.query(`
+      SELECT a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, b.brand_name,
+        t.name AS template_name
+      FROM survey_assignments a
+      JOIN survey_campaigns c ON c.id = a.campaign_id
+      LEFT JOIN brands b ON b.id = a.brand_id
+      LEFT JOIN survey_templates t ON t.id = c.template_id
+      WHERE a.status = 'pending' AND a.scheduled_date <= CURRENT_DATE AND c.status = 'active'
+        AND ( a.assigned_agent_id = $1 OR (c.assignment_mode = 'open' AND a.assigned_agent_id IS NULL) )
+      ORDER BY a.scheduled_date ASC, a.created_at ASC
+      LIMIT 300
+    `, [userId]);
+    return rows;
+  }
+
+  static async getSurveyAssignmentById(id: string): Promise<any | undefined> {
+    const { rows } = await pool.query(`
+      SELECT a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, c.status AS campaign_status,
+        b.brand_name, t.name AS template_name, ag.full_name AS agent_name
+      FROM survey_assignments a
+      JOIN survey_campaigns c ON c.id = a.campaign_id
+      LEFT JOIN brands b ON b.id = a.brand_id
+      LEFT JOIN survey_templates t ON t.id = c.template_id
+      LEFT JOIN users ag ON ag.id = a.assigned_agent_id
+      WHERE a.id = $1 LIMIT 1
+    `, [id]);
+    if (!rows[0]) return undefined;
+    const questions = rows[0].template_id
+      ? (await pool.query("SELECT * FROM survey_questions WHERE template_id = $1 ORDER BY q_order ASC", [rows[0].template_id])).rows
+      : [];
+    const attempts = (await pool.query(`
+      SELECT sa.*, u.full_name AS agent_name FROM survey_call_attempts sa
+      LEFT JOIN users u ON u.id = sa.agent_id WHERE sa.assignment_id = $1 ORDER BY sa.attempt_number ASC
+    `, [id])).rows;
+    return { ...rows[0], questions, attempts };
+  }
+
+  static async addSurveyAttempt(data: { assignment_id: string; agent_id: string; outcome: string; note?: string }): Promise<{ attempt: any; assignment: any }> {
+    const asg = await DB.getSurveyAssignmentById(data.assignment_id);
+    if (!asg) throw new Error("Assignment not found.");
+    const n = (asg.attempt_count || 0) + 1;
+    const id = "scatt-" + Date.now() + "-" + Math.floor(Math.random() * 999);
+    const { rows } = await pool.query(
+      `INSERT INTO survey_call_attempts (id,assignment_id,agent_id,attempt_number,outcome,note,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,now()) RETURNING *`,
+      [id, data.assignment_id, data.agent_id, n, data.outcome, data.note || null]
+    );
+
+    // Determine new status
+    const sets: string[] = ["attempt_count = $1"]; const vals: any[] = [n]; let idx = 2;
+    let newStatus = "in_progress";
+    let becameNotReached = false;
+    if (data.outcome === "declined") {
+      newStatus = "declined";
+      becameNotReached = true;
+    } else if (data.outcome !== "answered" && n >= 3) {
+      if (asg.continuity_type === "continuous") {
+        // Reschedule to next day, reset attempts, keep pending
+        newStatus = "pending";
+        sets[0] = "attempt_count = 0";
+        sets.push(`scheduled_date = CURRENT_DATE + 1`);
+      } else {
+        newStatus = "unreachable";
+        becameNotReached = true;
+      }
+    }
+    sets.push(`status = $${idx++}`); vals.push(newStatus);
+    // When the call reaches a terminal "Not Reached (No Action)" state, stamp reachability + completion time
+    if (becameNotReached) {
+      sets.push(`reachability = 'not_reached'`);
+      sets.push(`action_type = 'no_action'`);
+      sets.push(`completed_at = now()`);
+    }
+    vals.push(data.assignment_id);
+    await pool.query(`UPDATE survey_assignments SET ${sets.join(",")} WHERE id = $${idx}`, vals);
+
+    // Mirror a Not Reached (No Action) outcome into Survey Data so it stays available for reporting
+    if (becameNotReached) {
+      const agentName = asg.agent_name || (await pool.query("SELECT full_name FROM users WHERE id = $1", [data.agent_id])).rows[0]?.full_name || null;
+      const srid = "srec-" + Date.now() + "-" + Math.floor(Math.random() * 99999);
+      await pool.query(
+        `INSERT INTO survey_records (id,record_type,brand_id,brand_label,phone,served_by,answered,note,extra,record_date,uploaded_by,created_at)
+         VALUES ($1,'survey_live',$2,$3,$4,$5,false,'no_action',$6, to_char(now() + interval '3 hours','YYYY-MM-DD'),$7, now())`,
+        [srid, asg.brand_id || null, asg.brand_name || null, asg.customer_phone || null, agentName,
+         JSON.stringify({ reachability: "not_reached", action_type: "no_action", campaign_id: asg.campaign_id, outcome: data.outcome }), data.agent_id]
+      );
+    }
+
+    return { attempt: rows[0], assignment: await DB.getSurveyAssignmentById(data.assignment_id) };
+  }
+
+  static async addSurveyResponse(data: {
+    assignment_id: string; agent_id: string;
+    answers: { question_id: string; answer_value?: string; answered: boolean }[];
+    brand_id: string | null; customer_phone: string;
+    reachability?: string; action_type?: string; segment?: string;
+  }): Promise<any> {
+    const reachability = data.reachability === "not_reached" ? "not_reached" : "reached";
+    const action_type = data.action_type === "complaint" ? "complaint" : "no_action";
+    const answered = reachability === "reached";
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const asg = await DB.getSurveyAssignmentById(data.assignment_id);
+      const rid = "sresp-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+      await client.query(
+        "INSERT INTO survey_responses (id,assignment_id,agent_id,answered_at) VALUES ($1,$2,$3,now())",
+        [rid, data.assignment_id, data.agent_id]
+      );
+      // Derive a headline rate + comment for the Survey Data record from the answers
+      let rate: number | null = null;
+      let comment: string | null = null;
+      const answers = answered ? data.answers : [];
+      for (let i = 0; i < answers.length; i++) {
+        const a = answers[i];
+        const aid = "sans-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
+        await client.query(
+          "INSERT INTO survey_answers (id,response_id,question_id,answer_value,answered) VALUES ($1,$2,$3,$4,$5)",
+          [aid, rid, a.question_id, a.answer_value || null, !!a.answered]
+        );
+      }
+      if (answered && answers.length) {
+        const qids = answers.map((a) => a.question_id).filter(Boolean);
+        const { rows: qs } = await client.query("SELECT id, answer_type FROM survey_questions WHERE id = ANY($1)", [qids]);
+        const qtype = new Map(qs.map((q: any) => [q.id, q.answer_type]));
+        for (const a of answers) {
+          const t = qtype.get(a.question_id);
+          if ((t === "rating_1_5" || t === "rating_1_10") && rate == null) {
+            const n = parseInt(String(a.answer_value), 10);
+            if (!isNaN(n)) rate = t === "rating_1_10" ? Math.max(1, Math.round(n / 2)) : n;
+          } else if (t === "free_text" && a.answer_value && !comment) {
+            comment = String(a.answer_value);
+          }
+        }
+      }
+      // Terminal status: successful when reached, unreachable when not
+      const newStatus = answered ? "successful" : "unreachable";
+      await client.query(
+        "UPDATE survey_assignments SET status = $2, reachability = $3, action_type = $4, completed_at = now() WHERE id = $1",
+        [data.assignment_id, newStatus, reachability, action_type]
+      );
+      // Mirror the outcome into Survey Data (survey_records) so it shows in reports/history
+      const agentName = asg?.agent_name || (await client.query("SELECT full_name FROM users WHERE id = $1", [data.agent_id])).rows[0]?.full_name || null;
+      const complaint = action_type === "complaint" ? (comment || "Complaint") : null;
+      const srid = "srec-" + Date.now() + "-" + Math.floor(Math.random() * 99999);
+      await client.query(
+        `INSERT INTO survey_records (id,record_type,brand_id,brand_label,phone,served_by,rate,answered,comment,complaint,note,segment,extra,record_date,uploaded_by,created_at)
+         VALUES ($1,'survey_live',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, to_char(now() + interval '3 hours','YYYY-MM-DD'), $13, now())`,
+        [srid, data.brand_id, asg?.brand_name || null, data.customer_phone, agentName, rate, answered,
+         comment, complaint, action_type, data.segment || null, JSON.stringify({ reachability, action_type, segment: data.segment || null, campaign_id: asg?.campaign_id, template: asg?.template_name }), data.agent_id]
+      );
+      // Update contact recency
+      const ccid = "cc-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+      await client.query(
+        `INSERT INTO customer_contacts (id,brand_id,phone_number,last_contacted_at,last_contacted_brand_id)
+         VALUES ($1,$2,$3,now(),$2)
+         ON CONFLICT (brand_id,phone_number) DO UPDATE SET last_contacted_at = now(), last_contacted_brand_id = EXCLUDED.brand_id`,
+        [ccid, data.brand_id, data.customer_phone]
+      );
+      await client.query("COMMIT");
+      return DB.getSurveyAssignmentById(data.assignment_id);
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Manually assign (or reassign, or clear) a single survey assignment
+  static async assignSurveyAssignment(assignmentId: string, agentId: string | null): Promise<any> {
+    await pool.query("UPDATE survey_assignments SET assigned_agent_id = $1 WHERE id = $2", [agentId, assignmentId]);
+    return DB.getSurveyAssignmentById(assignmentId);
+  }
+
+  // All survey assignments across campaigns, for the "View All Surveys" page + reporting
+  static async getAllSurveyAssignments(filter: {
+    brand_id?: string; agent_id?: string; status?: string; action_type?: string; from?: string; to?: string;
+  } = {}): Promise<{ records: any[]; total: number; cap: number }> {
+    const clauses: string[] = []; const values: any[] = []; let idx = 1;
+    if (filter.brand_id) { clauses.push(`a.brand_id = $${idx++}`); values.push(filter.brand_id); }
+    if (filter.agent_id === "unassigned") { clauses.push(`a.assigned_agent_id IS NULL`); }
+    else if (filter.agent_id) { clauses.push(`a.assigned_agent_id = $${idx++}`); values.push(filter.agent_id); }
+    // Status buckets: pending (pending+in_progress), completed (successful), not_reached (unreachable+declined)
+    if (filter.status === "pending") { clauses.push(`a.status IN ('pending','in_progress')`); }
+    else if (filter.status === "completed") { clauses.push(`a.status = 'successful'`); }
+    else if (filter.status === "not_reached") { clauses.push(`a.status IN ('unreachable','declined')`); }
+    if (filter.action_type) { clauses.push(`a.action_type = $${idx++}`); values.push(filter.action_type); }
+    if (filter.from) { clauses.push(`a.created_at >= $${idx++}`); values.push(filter.from); }
+    if (filter.to) { clauses.push(`a.created_at <= $${idx++}`); values.push(filter.to); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const CAP = 1000;
+    const { rows } = await pool.query(`
+      SELECT a.*, b.brand_name, u.full_name AS agent_name, c.assignment_mode, t.name AS template_name
+      FROM survey_assignments a
+      LEFT JOIN brands b ON b.id = a.brand_id
+      LEFT JOIN users u ON u.id = a.assigned_agent_id
+      LEFT JOIN survey_campaigns c ON c.id = a.campaign_id
+      LEFT JOIN survey_templates t ON t.id = c.template_id
+      ${where}
+      ORDER BY a.created_at DESC LIMIT ${CAP}
+    `, values);
+    const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS total FROM survey_assignments a ${where}`, values);
+    return { records: rows, total: cnt[0]?.total ?? rows.length, cap: CAP };
+  }
+
+  static async getCampaignAssignments(campaignId: string): Promise<any[]> {
+    const { rows } = await pool.query(`
+      SELECT a.*, u.full_name AS agent_name FROM survey_assignments a
+      LEFT JOIN users u ON u.id = a.assigned_agent_id
+      WHERE a.campaign_id = $1 ORDER BY a.created_at ASC LIMIT 500
+    `, [campaignId]);
+    return rows;
+  }
+
+  // Manually assign N unassigned pending numbers of a campaign to an agent
+  static async assignCampaignNumbers(campaignId: string, agentId: string, count: number): Promise<number> {
+    const { rows } = await pool.query(
+      `SELECT id FROM survey_assignments WHERE campaign_id = $1 AND assigned_agent_id IS NULL AND status = 'pending'
+       ORDER BY created_at ASC LIMIT $2`,
+      [campaignId, count]
+    );
+    if (!rows.length) return 0;
+    const ids = rows.map((r) => r.id);
+    await pool.query("UPDATE survey_assignments SET assigned_agent_id = $1 WHERE id = ANY($2)", [agentId, ids]);
+    return ids.length;
+  }
+
+  static async getSurveyAgents(): Promise<any[]> {
+    const { rows } = await pool.query(`
+      SELECT id, full_name, role, work_type FROM users
+      WHERE status = 'Active' AND (work_type IS NULL OR work_type IN ('survey','both'))
+      ORDER BY full_name ASC
+    `);
+    return rows;
+  }
+
+  static async countTodaySuccess(userId: string): Promise<number> {
+    const { rows } = await pool.query<{ c: string }>(
+      `SELECT COUNT(*)::int AS c FROM survey_responses WHERE agent_id = $1 AND answered_at::date = CURRENT_DATE`,
+      [userId]
+    );
+    return Number(rows[0]?.c || 0);
+  }
+
+  // ----------------------------------------------------
+  // Surveys — Records (uploaded results)
+  // ----------------------------------------------------
+  static async addSurveyRecords(records: any[]): Promise<number> {
+    if (!records.length) return 0;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (let i = 0; i < records.length; i++) {
+        const r = records[i];
+        const id = "srec-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
+        await client.query(`
+          INSERT INTO survey_records (id,record_type,brand_id,brand_label,platform_id,platform_label,order_id,phone,customer_name,item_name,rate,product_feedback,served_by,answered,customer_suggestion,comment,complaint,note,trials,segment,extra,record_date,uploaded_by,created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,now())
+        `, [id, r.record_type, r.brand_id || null, r.brand_label || null, r.platform_id || null, r.platform_label || null,
+            r.order_id || null, r.phone || null, r.customer_name || null, r.item_name || null,
+            r.rate ?? null, r.product_feedback || null, r.served_by || null, !!r.answered,
+            r.customer_suggestion || null, r.comment || null, r.complaint || null, r.note || null,
+            r.trials || null, r.segment || null, r.extra ? JSON.stringify(r.extra) : null, r.record_date || null, r.uploaded_by]);
+      }
+      await client.query("COMMIT");
+      return records.length;
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  static async getSurveyRecords(filter: {
+    record_type?: string; brand_id?: string; answered?: boolean; from?: string; to?: string;
+  } = {}): Promise<{ records: any[]; total: number; cap: number }> {
+    const clauses: string[] = []; const values: any[] = []; let idx = 1;
+    if (filter.record_type) { clauses.push(`r.record_type = $${idx++}`); values.push(filter.record_type); }
+    if (filter.brand_id) { clauses.push(`r.brand_id = $${idx++}`); values.push(filter.brand_id); }
+    if (filter.answered != null) { clauses.push(`r.answered = $${idx++}`); values.push(filter.answered); }
+    if (filter.from) { clauses.push(`r.created_at >= $${idx++}`); values.push(filter.from); }
+    if (filter.to) { clauses.push(`r.created_at <= $${idx++}`); values.push(filter.to); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const LIST_CAP = 1000;
+    const { rows } = await pool.query(`
+      SELECT r.*, b.brand_name, p.name AS platform_name, u.full_name AS uploaded_by_name
+      FROM survey_records r
+      LEFT JOIN brands b ON b.id = r.brand_id
+      LEFT JOIN platforms p ON p.id = r.platform_id
+      LEFT JOIN users u ON u.id = r.uploaded_by
+      ${where}
+      ORDER BY r.created_at DESC LIMIT ${LIST_CAP}
+    `, values);
+    const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS total FROM survey_records r ${where}`, values);
+    return { records: rows, total: cnt[0]?.total ?? rows.length, cap: LIST_CAP };
+  }
+
+  // Delete survey records (optionally scoped by the same filters as the list).
+  static async deleteSurveyRecords(filter: {
+    record_type?: string; brand_id?: string; answered?: boolean; from?: string; to?: string;
+  } = {}): Promise<number> {
+    const clauses: string[] = []; const values: any[] = []; let idx = 1;
+    if (filter.record_type) { clauses.push(`record_type = $${idx++}`); values.push(filter.record_type); }
+    if (filter.brand_id) { clauses.push(`brand_id = $${idx++}`); values.push(filter.brand_id); }
+    if (filter.answered != null) { clauses.push(`answered = $${idx++}`); values.push(filter.answered); }
+    if (filter.from) { clauses.push(`created_at >= $${idx++}`); values.push(filter.from); }
+    if (filter.to) { clauses.push(`created_at <= $${idx++}`); values.push(filter.to); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const res = await pool.query(`DELETE FROM survey_records ${where}`, values);
+    return res.rowCount ?? 0;
+  }
+
+  // Remove duplicate survey records — keeps the earliest row per
+  // (record_type, order_id); only dedupes rows that carry an order_id.
+  static async dedupeSurveyRecords(): Promise<number> {
+    const res = await pool.query(`
+      DELETE FROM survey_records a USING survey_records b
+      WHERE a.id > b.id
+        AND a.record_type = b.record_type
+        AND a.order_id IS NOT NULL AND a.order_id <> ''
+        AND a.order_id = b.order_id
+        AND COALESCE(a.phone,'') = COALESCE(b.phone,'')
+    `);
+    return res.rowCount ?? 0;
+  }
+
+  // ----------------------------------------------------
+  // Feedback dashboard — aggregated Ratings + Surveys analytics
+  // fromISO/toISO are UTC ISO strings (or null for all-time).
+  // ----------------------------------------------------
+  static async getFeedbackDashboard(fromISO: string | null, toISO: string | null): Promise<any> {
+    const dr = [fromISO, toISO];
+    const q = (sql: string) => pool.query(sql, dr);
+    const rW = `($1::timestamptz IS NULL OR r.uploaded_at >= $1) AND ($2::timestamptz IS NULL OR r.uploaded_at <= $2)`;
+    const tW = `($1::timestamptz IS NULL OR created_at >= $1) AND ($2::timestamptz IS NULL OR created_at <= $2)`;
+
+    // ---- Ratings / Reviews ----
+    const rTot = (await q(`SELECT COUNT(*)::int total, COALESCE(ROUND(AVG(rating)::numeric,2),0)::float avg_rating,
+        SUM(CASE WHEN requires_action THEN 1 ELSE 0 END)::int needs_action,
+        SUM(CASE WHEN action_status IN ('resolved','no_action_needed') THEN 1 ELSE 0 END)::int resolved,
+        SUM(CASE WHEN action_status='unreachable' THEN 1 ELSE 0 END)::int unreachable
+      FROM ratings r WHERE ${rW}`)).rows[0];
+    const rByStatus = (await q(`SELECT action_status name, COUNT(*)::int count FROM ratings r WHERE ${rW} GROUP BY action_status ORDER BY count DESC`)).rows;
+    const rByRating = (await q(`SELECT rating::text name, COUNT(*)::int count FROM ratings r WHERE ${rW} GROUP BY rating ORDER BY rating`)).rows;
+    const rByBrand = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*)::int count FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC LIMIT 8`)).rows;
+    const rByPlatform = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*)::int count FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC LIMIT 8`)).rows;
+    // Avg rating per platform / per brand (spec §6)
+    const platformPerf = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*)::int count, COALESCE(ROUND(AVG(rating)::numeric,2),0)::float avg FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC LIMIT 10`)).rows;
+    const brandPerf = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*)::int count, COALESCE(ROUND(AVG(rating)::numeric,2),0)::float avg FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC LIMIT 10`)).rows;
+    const rByAgent = (await q(`SELECT ua.full_name name, COUNT(*)::int assigned,
+        SUM(CASE WHEN r.action_status IN ('resolved','no_action_needed','unreachable') THEN 1 ELSE 0 END)::int done
+      FROM ratings r JOIN users ua ON ua.id=r.assigned_agent_id WHERE ${rW} AND r.assigned_agent_id IS NOT NULL
+      GROUP BY ua.full_name ORDER BY assigned DESC LIMIT 10`)).rows;
+
+    // ---- Surveys ----
+    const campTotal = (await q(`SELECT COUNT(*)::int c FROM survey_campaigns WHERE ${tW}`)).rows[0].c;
+    const campByStatus = (await q(`SELECT status name, COUNT(*)::int count FROM survey_campaigns WHERE ${tW} GROUP BY status ORDER BY count DESC`)).rows;
+    const asgTot = (await q(`SELECT COUNT(*)::int total,
+        SUM(CASE WHEN status='successful' THEN 1 ELSE 0 END)::int successful
+      FROM survey_assignments WHERE ${tW}`)).rows[0];
+    const asgByStatus = (await q(`SELECT status name, COUNT(*)::int count FROM survey_assignments WHERE ${tW} GROUP BY status ORDER BY count DESC`)).rows;
+    const recTot = (await q(`SELECT COUNT(*)::int total,
+        SUM(CASE WHEN answered THEN 1 ELSE 0 END)::int answered,
+        SUM(CASE WHEN NOT answered THEN 1 ELSE 0 END)::int no_answer
+      FROM survey_records WHERE ${tW}`)).rows[0];
+    const recByType = (await q(`SELECT record_type name, COUNT(*)::int count FROM survey_records WHERE ${tW} GROUP BY record_type ORDER BY count DESC`)).rows;
+    const recByBrand = (await q(`SELECT COALESCE(b.brand_name, sr.brand_label, '—') name, COUNT(*)::int count
+      FROM survey_records sr LEFT JOIN brands b ON b.id=sr.brand_id
+      WHERE ($1::timestamptz IS NULL OR sr.created_at >= $1) AND ($2::timestamptz IS NULL OR sr.created_at <= $2)
+      GROUP BY COALESCE(b.brand_name, sr.brand_label, '—') ORDER BY count DESC LIMIT 8`)).rows;
+    const surveyTopAgents = (await q(`SELECT u.full_name name, COUNT(*)::int successful
+      FROM survey_responses resp JOIN users u ON u.id=resp.agent_id
+      WHERE ($1::timestamptz IS NULL OR resp.answered_at >= $1) AND ($2::timestamptz IS NULL OR resp.answered_at <= $2)
+      GROUP BY u.full_name ORDER BY successful DESC LIMIT 10`)).rows;
+    // Survey records per employee (Served By) — includes historical imports.
+    const recByAgent = (await q(`SELECT COALESCE(NULLIF(TRIM(served_by),''),'—') name,
+        COUNT(*)::int count,
+        SUM(CASE WHEN answered THEN 1 ELSE 0 END)::int answered,
+        COALESCE(ROUND(AVG(rate)::numeric,2),0)::float avg
+      FROM survey_records WHERE ${tW} GROUP BY COALESCE(NULLIF(TRIM(served_by),''),'—')
+      ORDER BY count DESC LIMIT 30`)).rows;
+
+    return {
+      ratings: {
+        total: rTot.total, avgRating: Number(rTot.avg_rating), needsAction: rTot.needs_action,
+        resolved: rTot.resolved, unreachable: rTot.unreachable,
+        resolutionRate: rTot.needs_action > 0 ? Math.round((rTot.resolved / rTot.needs_action) * 100) : 0,
+        byStatus: rByStatus, byRating: rByRating, byBrand: rByBrand, byPlatform: rByPlatform, byAgent: rByAgent,
+        platformPerf, brandPerf,
+      },
+      surveys: {
+        campaigns: { total: campTotal, byStatus: campByStatus },
+        assignments: {
+          total: asgTot.total, successful: asgTot.successful,
+          successRate: asgTot.total > 0 ? Math.round((asgTot.successful / asgTot.total) * 100) : 0,
+          byStatus: asgByStatus,
+        },
+        records: { total: recTot.total, answered: recTot.answered, noAnswer: recTot.no_answer, byType: recByType, byBrand: recByBrand, byAgent: recByAgent },
+        topAgents: surveyTopAgents,
+      },
+    };
+  }
+}
