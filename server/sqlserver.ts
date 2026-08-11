@@ -32,43 +32,52 @@
  */
 import sql from "mssql";
 
-const server = process.env.SQLSERVER_HOST;
-const database = process.env.SQLSERVER_DB;
-const user = process.env.SQLSERVER_USER;
-const password = process.env.SQLSERVER_PASSWORD;
-
-if (!server || !database || !user || !password) {
-  throw new Error(
-    "SQL Server connection is not configured. Set SQLSERVER_HOST, SQLSERVER_DB, " +
-      "SQLSERVER_USER and SQLSERVER_PASSWORD (see .env.example)."
-  );
-}
-
-const config: sql.config = {
-  server,
-  database,
-  user,
-  password,
-  port: Number(process.env.SQLSERVER_PORT) || 1433,
-  options: {
-    // Company SQL Server instances commonly use a self-signed certificate.
-    trustServerCertificate: process.env.SQLSERVER_TRUST_CERT !== "false",
-    encrypt: process.env.SQLSERVER_ENCRYPT === "true",
-    // Keep DATETIMEOFFSET/DATETIME2 values as JS Dates in UTC, so the app's
-    // existing date handling behaves the same as it did under Postgres.
-    useUTC: true,
-  },
-  pool: {
-    max: Number(process.env.SQLSERVER_POOL_MAX) || 10,
-    min: 0,
-    idleTimeoutMillis: 30_000,
-  },
-  requestTimeout: Number(process.env.SQLSERVER_REQUEST_TIMEOUT) || 60_000,
-};
-
 export interface QueryResult<T = any> {
   rows: T[];
   rowCount: number;
+}
+
+/**
+ * Read connection settings from process.env lazily (on first use), not at
+ * module load. ES module imports are hoisted and run before any code in the
+ * importing file — including a top-level `dotenv.config()` call in
+ * server.ts — so reading env vars here at import time would see them as
+ * still unset even though .env genuinely has them.
+ */
+function readConfig(): sql.config {
+  const server = process.env.SQLSERVER_HOST;
+  const database = process.env.SQLSERVER_DB;
+  const user = process.env.SQLSERVER_USER;
+  const password = process.env.SQLSERVER_PASSWORD;
+
+  if (!server || !database || !user || !password) {
+    throw new Error(
+      "SQL Server connection is not configured. Set SQLSERVER_HOST, SQLSERVER_DB, " +
+        "SQLSERVER_USER and SQLSERVER_PASSWORD (see .env.example)."
+    );
+  }
+
+  return {
+    server,
+    database,
+    user,
+    password,
+    port: Number(process.env.SQLSERVER_PORT) || 1433,
+    options: {
+      // Company SQL Server instances commonly use a self-signed certificate.
+      trustServerCertificate: process.env.SQLSERVER_TRUST_CERT !== "false",
+      encrypt: process.env.SQLSERVER_ENCRYPT === "true",
+      // Keep DATETIMEOFFSET/DATETIME2 values as JS Dates in UTC, so the app's
+      // existing date handling behaves the same as it did under Postgres.
+      useUTC: true,
+    },
+    pool: {
+      max: Number(process.env.SQLSERVER_POOL_MAX) || 10,
+      min: 0,
+      idleTimeoutMillis: 30_000,
+    },
+    requestTimeout: Number(process.env.SQLSERVER_REQUEST_TIMEOUT) || 60_000,
+  };
 }
 
 /** Lazily-created shared connection pool (mssql connects asynchronously). */
@@ -76,7 +85,7 @@ let poolPromise: Promise<sql.ConnectionPool> | null = null;
 
 function getPool(): Promise<sql.ConnectionPool> {
   if (!poolPromise) {
-    poolPromise = new sql.ConnectionPool(config)
+    poolPromise = new sql.ConnectionPool(readConfig())
       .connect()
       .catch((err) => {
         // Let a later call retry instead of caching a permanently failed pool.
