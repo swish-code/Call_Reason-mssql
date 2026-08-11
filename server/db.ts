@@ -1,29 +1,13 @@
-import pkg from "pg";
 import bcrypt from "bcryptjs";
 import { User, Interaction, Brand, Category, Branch, AuditLog, DropdownOption, OpsLog, AssignedTask } from "../src/types.js";
-
-const { Pool } = pkg;
+import { pool } from "./sqlserver.js";
 
 // ----------------------------------------------------
-// Postgres connection pool
+// Microsoft SQL Server connection
 // ----------------------------------------------------
-const connectionString = process.env.DATABASE_URL;
-if (!connectionString) {
-  throw new Error(
-    "DATABASE_URL is not set. This app now persists data in PostgreSQL. " +
-      "On Railway link the Postgres service (DATABASE_URL=${{Postgres.DATABASE_URL}}); " +
-      "for local development point it to a Postgres instance."
-  );
-}
-
-// Railway's private network does not use SSL. Allow opting into SSL (e.g. when
-// connecting through the public proxy URL) via PGSSL=require.
-const useSSL = process.env.PGSSL === "require" || /sslmode=require/.test(connectionString);
-
-const pool = new Pool({
-  connectionString,
-  ssl: useSSL ? { rejectUnauthorized: false } : undefined,
-});
+// The pool lives in ./sqlserver.ts, which exposes a `pg`-shaped query API
+// (pool.query -> { rows, rowCount }; pool.connect -> a client understanding
+// BEGIN/COMMIT/ROLLBACK). Connection settings come from SQLSERVER_* env vars.
 
 // Helper to format ISO dates relative to today (used only for seed data)
 function getDateRelative(daysOffset: number): string {
@@ -125,323 +109,26 @@ export class DB {
   // Schema creation + one-time seeding
   // ----------------------------------------------------
   static async init(): Promise<void> {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        full_name TEXT NOT NULL,
-        name TEXT,
-        username TEXT NOT NULL,
-        email TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL,
-        level INTEGER,
-        job_title TEXT,
-        team TEXT,
-        status TEXT NOT NULL,
-        created_at TEXT,
-        updated_at TEXT,
-        created_by TEXT
+    // Tables are created by sql/schema.sql, run once against the database via
+    // SSMS — this file issues no DDL. One source of truth for the schema means
+    // the DBA-run script and the application cannot drift apart.
+    // Fail fast with an actionable message if it has not been applied yet.
+    const { rows: present } = await pool.query<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM sys.tables WHERE name IN ('users','brands','logs','ratings','survey_records')"
+    );
+    if (Number(present[0]?.n ?? 0) < 5) {
+      throw new Error(
+        "SQL Server schema is missing. Run sql/schema.sql against the target database " +
+          "(SSMS: open the file, pick the database, Execute) before starting the app."
       );
-      CREATE TABLE IF NOT EXISTS brands (
-        id TEXT PRIMARY KEY,
-        brand_name TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS categories (
-        id TEXT PRIMARY KEY,
-        category_name TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS branches (
-        id TEXT PRIMARY KEY,
-        branch_name TEXT NOT NULL,
-        brand TEXT
-      );
-      CREATE TABLE IF NOT EXISTS interactions (
-        id TEXT PRIMARY KEY,
-        interaction_date TEXT,
-        interaction_time TEXT,
-        agent_id TEXT,
-        agent_name TEXT,
-        customer_name TEXT,
-        customer_phone TEXT,
-        interaction_type TEXT,
-        communication_type TEXT,
-        call_direction TEXT,
-        brand TEXT,
-        category TEXT,
-        call_reason TEXT,
-        order_number TEXT,
-        branch TEXT,
-        team TEXT,
-        customer_type TEXT,
-        call_from TEXT,
-        aggregator_name TEXT,
-        comments TEXT,
-        complaint_reason TEXT,
-        fcr TEXT,
-        priority TEXT,
-        status TEXT,
-        summary TEXT,
-        action_taken TEXT,
-        follow_up_required BOOLEAN DEFAULT false,
-        follow_up_date TEXT,
-        follow_up_notes TEXT,
-        attachments JSONB DEFAULT '[]'::jsonb,
-        created_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS audit_logs (
-        id TEXT PRIMARY KEY,
-        timestamp TEXT,
-        operator_id TEXT,
-        operator_name TEXT,
-        operator_role TEXT,
-        category TEXT,
-        action TEXT,
-        details TEXT,
-        related_ref TEXT,
-        ip_address TEXT
-      );
-      CREATE TABLE IF NOT EXISTS options (
-        id TEXT PRIMARY KEY,
-        list_key TEXT NOT NULL,
-        label TEXT NOT NULL,
-        sort_order INTEGER DEFAULT 0,
-        active BOOLEAN DEFAULT true
-      );
-      CREATE TABLE IF NOT EXISTS assigned_tasks (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        description TEXT,
-        assigned_by TEXT,
-        assigned_by_name TEXT,
-        assigned_to TEXT,
-        assigned_to_name TEXT,
-        department TEXT,
-        priority TEXT,
-        due_date TEXT,
-        status TEXT DEFAULT 'New',
-        seen BOOLEAN DEFAULT false,
-        duration_seconds INTEGER DEFAULT 0,
-        note TEXT,
-        created_at TEXT,
-        updated_at TEXT,
-        completed_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS recurring_templates (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        description TEXT,
-        department TEXT,
-        priority TEXT DEFAULT 'Medium',
-        recurrence_type TEXT DEFAULT 'daily',
-        days_of_week TEXT,
-        due_time TEXT,
-        assign_mode TEXT DEFAULT 'pool',
-        active BOOLEAN DEFAULT true,
-        created_by TEXT,
-        created_by_name TEXT,
-        created_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS shift_sessions (
-        id TEXT PRIMARY KEY,
-        user_id TEXT,
-        user_name TEXT,
-        department TEXT,
-        started_at TEXT,
-        ended_at TEXT,
-        duration_seconds INTEGER DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS logs (
-        id TEXT PRIMARY KEY,
-        log_type TEXT NOT NULL,
-        department TEXT,
-        activity_type TEXT,
-        status TEXT,
-        agent_id TEXT,
-        agent_name TEXT,
-        branch TEXT,
-        brand TEXT,
-        order_number TEXT,
-        aggregator TEXT,
-        customer_name TEXT,
-        complaint_id TEXT,
-        target_agent_name TEXT,
-        notes TEXT,
-        action_taken TEXT,
-        resolution_notes TEXT,
-        action_plan TEXT,
-        follow_up_date TEXT,
-        started_at TEXT,
-        duration_seconds INTEGER DEFAULT 0,
-        running_since TEXT,
-        created_at TEXT,
-        updated_at TEXT,
-        created_by TEXT
-      );
-    `);
-
-    // Ratings / Reviews module tables
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS platforms (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE
-      );
-      CREATE TABLE IF NOT EXISTS ratings (
-        id TEXT PRIMARY KEY,
-        brand_id TEXT NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
-        platform_id TEXT NOT NULL REFERENCES platforms(id) ON DELETE RESTRICT,
-        order_id TEXT NOT NULL,
-        rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
-        review_text TEXT,
-        customer_phone TEXT,
-        requires_action BOOLEAN DEFAULT false,
-        action_status TEXT DEFAULT 'pending',
-        assigned_agent_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        action_note TEXT,
-        uploaded_by TEXT REFERENCES users(id),
-        uploaded_at TIMESTAMPTZ DEFAULT now(),
-        resolved_at TIMESTAMPTZ,
-        recorded_by TEXT REFERENCES users(id),
-        recorded_at TIMESTAMPTZ,
-        order_date TEXT,
-        customer_name TEXT,
-        branch TEXT,
-        filled_by TEXT,
-        following_date TEXT,
-        surveyed_by TEXT,
-        complaint_type TEXT,
-        complaint_cases TEXT,
-        complaint_status TEXT,
-        served_by TEXT,
-        note TEXT,
-        UNIQUE (brand_id, platform_id, order_id)
-      );
-      CREATE TABLE IF NOT EXISTS rating_call_attempts (
-        id TEXT PRIMARY KEY,
-        rating_id TEXT NOT NULL REFERENCES ratings(id) ON DELETE CASCADE,
-        agent_id TEXT REFERENCES users(id),
-        agent_name TEXT,
-        attempt_number SMALLINT,
-        outcome TEXT NOT NULL,
-        note TEXT,
-        created_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE INDEX IF NOT EXISTS idx_ratings_brand ON ratings(brand_id);
-      CREATE INDEX IF NOT EXISTS idx_ratings_action ON ratings(requires_action, action_status);
-      CREATE INDEX IF NOT EXISTS idx_ratings_agent ON ratings(assigned_agent_id);
-    `);
-
-    // Surveys module tables (Call Campaigns + Survey Records)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS survey_templates (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
-        created_by TEXT REFERENCES users(id),
-        active BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS survey_questions (
-        id TEXT PRIMARY KEY,
-        template_id TEXT NOT NULL REFERENCES survey_templates(id) ON DELETE CASCADE,
-        text TEXT NOT NULL,
-        answer_type TEXT NOT NULL DEFAULT 'free_text',
-        options JSONB,
-        q_order INT DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS survey_campaigns (
-        id TEXT PRIMARY KEY,
-        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
-        requested_by TEXT REFERENCES users(id),
-        requester_role TEXT,
-        template_id TEXT REFERENCES survey_templates(id) ON DELETE SET NULL,
-        survey_type TEXT DEFAULT 'daily_normal',
-        assignment_mode TEXT DEFAULT 'open',
-        continuity_type TEXT DEFAULT 'one_time_slot',
-        requested_count INT DEFAULT 0,
-        duration_days INT DEFAULT 1,
-        status TEXT DEFAULT 'pending',
-        default_agent_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS survey_assignments (
-        id TEXT PRIMARY KEY,
-        campaign_id TEXT NOT NULL REFERENCES survey_campaigns(id) ON DELETE CASCADE,
-        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
-        customer_phone TEXT NOT NULL,
-        assigned_agent_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        attempt_count INT DEFAULT 0,
-        status TEXT DEFAULT 'pending',
-        scheduled_date DATE NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS survey_call_attempts (
-        id TEXT PRIMARY KEY,
-        assignment_id TEXT NOT NULL REFERENCES survey_assignments(id) ON DELETE CASCADE,
-        agent_id TEXT REFERENCES users(id),
-        attempt_number INT,
-        outcome TEXT NOT NULL,
-        note TEXT,
-        created_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS survey_responses (
-        id TEXT PRIMARY KEY,
-        assignment_id TEXT NOT NULL REFERENCES survey_assignments(id) ON DELETE CASCADE,
-        agent_id TEXT REFERENCES users(id),
-        answered_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS survey_answers (
-        id TEXT PRIMARY KEY,
-        response_id TEXT NOT NULL REFERENCES survey_responses(id) ON DELETE CASCADE,
-        question_id TEXT REFERENCES survey_questions(id) ON DELETE SET NULL,
-        answer_value TEXT,
-        answered BOOLEAN DEFAULT false
-      );
-      CREATE TABLE IF NOT EXISTS customer_contacts (
-        id TEXT PRIMARY KEY,
-        brand_id TEXT REFERENCES brands(id) ON DELETE CASCADE,
-        phone_number TEXT NOT NULL,
-        last_contacted_at TIMESTAMPTZ DEFAULT now(),
-        last_contacted_brand_id TEXT,
-        UNIQUE (brand_id, phone_number)
-      );
-      CREATE TABLE IF NOT EXISTS survey_records (
-        id TEXT PRIMARY KEY,
-        record_type TEXT NOT NULL,
-        brand_id TEXT REFERENCES brands(id) ON DELETE SET NULL,
-        brand_label TEXT,
-        platform_id TEXT REFERENCES platforms(id) ON DELETE SET NULL,
-        platform_label TEXT,
-        order_id TEXT,
-        phone TEXT,
-        customer_name TEXT,
-        item_name TEXT,
-        rate SMALLINT,
-        product_feedback TEXT,
-        served_by TEXT,
-        answered BOOLEAN DEFAULT false,
-        customer_suggestion TEXT,
-        comment TEXT,
-        complaint TEXT,
-        note TEXT,
-        trials TEXT,
-        extra JSONB,
-        record_date TEXT,
-        uploaded_by TEXT REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE INDEX IF NOT EXISTS idx_sa_sched ON survey_assignments(scheduled_date, status);
-      CREATE INDEX IF NOT EXISTS idx_sa_campaign ON survey_assignments(campaign_id);
-      CREATE INDEX IF NOT EXISTS idx_sa_agent ON survey_assignments(assigned_agent_id);
-      CREATE INDEX IF NOT EXISTS idx_srec_type ON survey_records(record_type);
-      CREATE INDEX IF NOT EXISTS idx_cc_phone ON customer_contacts(phone_number);
-    `);
+    }
 
     // Seed default platforms (idempotent). Fixed ids so re-seeding never
     // collides on the UNIQUE name after a platform is removed from this list.
     for (const [id, name] of [["plat-1", "Talabat"], ["plat-2", "Keeta"], ["plat-5", "TripAdvisor"],
       ["plat-6", "Deliveroo"], ["plat-7", "Ordable"], ["plat-8", "Jahez"], ["plat-9", "Snoonu"]]) {
       await pool.query(
-        "INSERT INTO platforms (id, name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING",
+        "IF NOT EXISTS (SELECT 1 FROM platforms WHERE id = $1) INSERT INTO platforms (id, name) VALUES ($1,$2)",
         [id, name]
       );
     }
@@ -453,54 +140,9 @@ export class DB {
         AND NOT EXISTS (SELECT 1 FROM survey_records sr WHERE sr.platform_id = platforms.id)
     `);
 
-    // Migrations for databases created before newer features
-    await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS can_upload BOOLEAN DEFAULT false;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS work_type TEXT DEFAULT 'both';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS team TEXT;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT;
-      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS department TEXT;
-      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS previous_value TEXT;
-      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS new_value TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS call_reason TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS order_number TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS branch TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS team TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS customer_type TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS call_from TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS aggregator_name TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS comments TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS complaint_reason TEXT;
-      ALTER TABLE interactions ADD COLUMN IF NOT EXISTS fcr TEXT;
-      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS operator_role TEXT;
-      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS category TEXT;
-      ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS related_ref TEXT;
-      ALTER TABLE branches ADD COLUMN IF NOT EXISTS brand TEXT;
-      ALTER TABLE logs ADD COLUMN IF NOT EXISTS started_at TEXT;
-      ALTER TABLE logs ADD COLUMN IF NOT EXISTS duration_seconds INTEGER DEFAULT 0;
-      ALTER TABLE logs ADD COLUMN IF NOT EXISTS calls_reviewed INTEGER;
-      ALTER TABLE survey_questions ADD COLUMN IF NOT EXISTS segment TEXT;
-      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS reachability TEXT;
-      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS action_type TEXT DEFAULT 'no_action';
-      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
-      ALTER TABLE survey_assignments ADD COLUMN IF NOT EXISTS segment TEXT;
-      ALTER TABLE survey_records ADD COLUMN IF NOT EXISTS segment TEXT;
-      ALTER TABLE logs ADD COLUMN IF NOT EXISTS running_since TEXT;
-      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS duration_seconds INTEGER DEFAULT 0;
-      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS note TEXT;
-      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS template_id TEXT;
-      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS task_date TEXT;
-      ALTER TABLE assigned_tasks ADD COLUMN IF NOT EXISTS require_time_entry BOOLEAN DEFAULT true;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS shift_status TEXT DEFAULT 'off';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS shift_started_at TEXT;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT;
-      CREATE UNIQUE INDEX IF NOT EXISTS uq_assigned_tasks_template_date ON assigned_tasks(template_id, task_date) WHERE template_id IS NOT NULL;
-    `);
-
     // FM staff are supervised by Quality — move any existing FM accounts there
     await pool.query(
-      "UPDATE users SET department = 'Quality' WHERE job_title IN ('FM', 'FM Team Leader') AND department IS DISTINCT FROM 'Quality'"
+      "UPDATE users SET department = 'Quality' WHERE job_title IN ('FM', 'FM Team Leader') AND (department IS NULL OR department <> 'Quality')"
     );
 
     // Backfill hierarchy level from the coarse role for legacy accounts
@@ -525,7 +167,7 @@ export class DB {
         await pool.query("DELETE FROM options WHERE list_key = 'quality_activity'");
         for (let i = 0; i < newQualityActivities.length; i++) {
           await pool.query(
-            "INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,'quality_activity',$2,$3,true) ON CONFLICT (id) DO NOTHING",
+            "IF NOT EXISTS (SELECT 1 FROM options WHERE id = $1) INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,'quality_activity',$2,$3,1)",
             [`opt-quality_activity-${i}`, newQualityActivities[i], i]
           );
         }
@@ -543,7 +185,7 @@ export class DB {
       "UPDATE users SET team = CASE WHEN role IN ('admin','leader') THEN 'Team Leader' ELSE 'Call Center' END WHERE team IS NULL OR team = ''"
     );
     await pool.query(
-      "UPDATE interactions i SET team = u.team FROM users u WHERE i.agent_id = u.id AND (i.team IS NULL OR i.team = '')"
+      "UPDATE i SET i.team = u.team FROM interactions i JOIN users u ON i.agent_id = u.id WHERE (i.team IS NULL OR i.team = '')"
     );
     await pool.query("UPDATE interactions SET team = 'Call Center' WHERE team IS NULL OR team = ''");
 
@@ -562,15 +204,15 @@ export class DB {
     // One-time: install the real company brands + per-brand branches.
     // Runs once (guarded by the presence of any branded branch), and replaces
     // the earlier demo brands/branches on existing databases.
-    const branded = await pool.query("SELECT 1 FROM branches WHERE brand IS NOT NULL LIMIT 1");
+    const branded = await pool.query("SELECT 1 FROM branches WHERE brand IS NOT NULL ");
     if (branded.rowCount === 0) {
       await pool.query("DELETE FROM brands WHERE brand_name IN ('Talabat','Noon','Amazon','Carrefour')");
       await pool.query("DELETE FROM branches WHERE brand IS NULL");
       for (const b of SEED_BRANDS) {
-        await pool.query("INSERT INTO brands (id, brand_name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING", [b.id, b.brand_name]);
+        await pool.query("IF NOT EXISTS (SELECT 1 FROM brands WHERE id = $1) INSERT INTO brands (id, brand_name) VALUES ($1,$2)", [b.id, b.brand_name]);
       }
       for (const br of SEED_BRANCHES) {
-        await pool.query("INSERT INTO branches (id, branch_name, brand) VALUES ($1,$2,$3) ON CONFLICT (id) DO NOTHING", [br.id, br.branch_name, br.brand ?? null]);
+        await pool.query("IF NOT EXISTS (SELECT 1 FROM branches WHERE id = $1) INSERT INTO branches (id, branch_name, brand) VALUES ($1,$2,$3)", [br.id, br.branch_name, br.brand ?? null]);
       }
     }
 
@@ -593,18 +235,18 @@ export class DB {
     // Seed each dropdown list once (idempotent per list_key, so new lists added
     // in code get seeded on the next boot without touching existing edits)
     for (const [key, labels] of Object.entries(DEFAULT_OPTIONS)) {
-      const c = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM options WHERE list_key = $1", [key]);
+      const c = await pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM options WHERE list_key = $1", [key]);
       if (Number(c.rows[0].count) === 0) {
         for (let idx = 0; idx < labels.length; idx++) {
           await pool.query(
-            "INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,$2,$3,$4,true) ON CONFLICT (id) DO NOTHING",
+            "IF NOT EXISTS (SELECT 1 FROM options WHERE id = $1) INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,$2,$3,$4,1)",
             [`opt-${key}-${idx}`, key, labels[idx], idx]
           );
         }
       }
     }
 
-    const { rows } = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM users");
+    const { rows } = await pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM users");
     if (Number(rows[0].count) === 0) {
       await DB.seed();
     }
@@ -617,30 +259,30 @@ export class DB {
 
       for (const u of SEED_USERS) {
         await client.query(
-          `INSERT INTO users (id, full_name, name, username, email, password_hash, role, team, status, created_at, updated_at, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
+          `IF NOT EXISTS (SELECT 1 FROM users WHERE id = $1) INSERT INTO users (id, full_name, name, username, email, password_hash, role, team, status, created_at, updated_at, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
           [u.id, u.full_name, u.name, u.username, u.email, u.password_hash, u.role, u.team ?? null, u.status, u.created_at, u.updated_at, u.created_by]
         );
       }
       for (const b of SEED_BRANDS) {
-        await client.query("INSERT INTO brands (id, brand_name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING", [b.id, b.brand_name]);
+        await client.query("IF NOT EXISTS (SELECT 1 FROM brands WHERE id = $1) INSERT INTO brands (id, brand_name) VALUES ($1,$2)", [b.id, b.brand_name]);
       }
       for (const c of SEED_CATEGORIES) {
-        await client.query("INSERT INTO categories (id, category_name) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING", [c.id, c.category_name]);
+        await client.query("IF NOT EXISTS (SELECT 1 FROM categories WHERE id = $1) INSERT INTO categories (id, category_name) VALUES ($1,$2)", [c.id, c.category_name]);
       }
       for (const b of SEED_BRANCHES) {
-        await client.query("INSERT INTO branches (id, branch_name, brand) VALUES ($1,$2,$3) ON CONFLICT (id) DO NOTHING", [b.id, b.branch_name, b.brand ?? null]);
+        await client.query("IF NOT EXISTS (SELECT 1 FROM branches WHERE id = $1) INSERT INTO branches (id, branch_name, brand) VALUES ($1,$2,$3)", [b.id, b.branch_name, b.brand ?? null]);
       }
       for (const i of SEED_INTERACTIONS) {
         await client.query(
-          `INSERT INTO interactions (id, interaction_date, interaction_time, agent_id, agent_name, customer_name, customer_phone, interaction_type, communication_type, call_direction, brand, category, call_reason, branch, team, priority, status, summary, action_taken, follow_up_required, follow_up_date, follow_up_notes, attachments, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT (id) DO NOTHING`,
+          `IF NOT EXISTS (SELECT 1 FROM interactions WHERE id = $1) INSERT INTO interactions (id, interaction_date, interaction_time, agent_id, agent_name, customer_name, customer_phone, interaction_type, communication_type, call_direction, brand, category, call_reason, branch, team, priority, status, summary, action_taken, follow_up_required, follow_up_date, follow_up_notes, attachments, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
           [i.id, i.interaction_date, i.interaction_time, i.agent_id, i.agent_name, i.customer_name, i.customer_phone, i.interaction_type, i.communication_type, i.call_direction, i.brand, i.category, i.call_reason ?? null, i.branch ?? null, i.team ?? null, i.priority, i.status, i.summary, i.action_taken, i.follow_up_required, i.follow_up_date ?? null, i.follow_up_notes ?? null, JSON.stringify(i.attachments ?? []), i.created_at]
         );
       }
 
       await client.query("COMMIT");
-      console.log("[CRM DB] Seed data inserted into PostgreSQL.");
+      console.log("[CRM DB] Seed data inserted into SQL Server.");
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;
@@ -658,27 +300,27 @@ export class DB {
   }
 
   static async getUserByEmail(email: string): Promise<User | undefined> {
-    const { rows } = await pool.query<User>("SELECT * FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1", [email]);
+    const { rows } = await pool.query<User>("SELECT * FROM users WHERE LOWER(email) = LOWER($1) ", [email]);
     return rows[0];
   }
 
   static async getUserByUsernameOrEmail(identifier: string): Promise<User | undefined> {
     const { rows } = await pool.query<User>(
-      "SELECT * FROM users WHERE LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1) LIMIT 1",
+      "SELECT * FROM users WHERE LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1) ",
       [identifier]
     );
     return rows[0];
   }
 
   static async getUserById(id: string): Promise<User | undefined> {
-    const { rows } = await pool.query<User>("SELECT * FROM users WHERE id = $1 LIMIT 1", [id]);
+    const { rows } = await pool.query<User>("SELECT * FROM users WHERE id = $1 ", [id]);
     return rows[0];
   }
 
   static async addUser(user: User): Promise<User> {
     const { rows } = await pool.query<User>(
-      `INSERT INTO users (id, full_name, name, username, email, password_hash, role, level, job_title, team, department, status, created_at, updated_at, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      `INSERT INTO users (id, full_name, name, username, email, password_hash, role, level, job_title, team, department, status, created_at, updated_at, created_by) OUTPUT INSERTED.*
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
       [user.id, user.full_name, user.name ?? user.full_name, user.username, user.email, user.password_hash, user.role, user.level ?? null, user.job_title ?? null, user.team ?? "Call Center", user.department ?? null, user.status, user.created_at, user.updated_at, user.created_by ?? null]
     );
     return rows[0];
@@ -705,7 +347,7 @@ export class DB {
 
     values.push(id);
     const { rows } = await pool.query<User>(
-      `UPDATE users SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE users SET ${sets.join(", ")} OUTPUT INSERTED.* WHERE id = $${idx}`,
       values
     );
     return rows[0];
@@ -805,7 +447,7 @@ export class DB {
 
   static async getOptionsByKey(listKey: string, activeOnly = true): Promise<DropdownOption[]> {
     const { rows } = await pool.query<DropdownOption>(
-      `SELECT * FROM options WHERE list_key = $1 ${activeOnly ? "AND active = true" : ""} ORDER BY sort_order ASC, label ASC`,
+      `SELECT * FROM options WHERE list_key = $1 ${activeOnly ? "AND active = 1" : ""} ORDER BY sort_order ASC, label ASC`,
       [listKey]
     );
     return rows;
@@ -816,7 +458,7 @@ export class DB {
     const nextOrder = (m.rows[0].max ?? -1) + 1;
     const id = "opt-" + Date.now() + "-" + Math.floor(Math.random() * 1000);
     const { rows } = await pool.query<DropdownOption>(
-      "INSERT INTO options (id, list_key, label, sort_order, active) VALUES ($1,$2,$3,$4,true) RETURNING *",
+      "INSERT INTO options (id, list_key, label, sort_order, active) OUTPUT INSERTED.* VALUES ($1,$2,$3,$4,1)",
       [id, listKey, label, nextOrder]
     );
     return rows[0];
@@ -834,7 +476,7 @@ export class DB {
     });
     if (sets.length === 0) return undefined;
     values.push(id);
-    const { rows } = await pool.query<DropdownOption>(`UPDATE options SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    const { rows } = await pool.query<DropdownOption>(`UPDATE options SET ${sets.join(", ")} OUTPUT INSERTED.* WHERE id = $${idx}`, values);
     return rows[0];
   }
 
@@ -879,7 +521,7 @@ export class DB {
   }
 
   static async getLogById(id: string): Promise<OpsLog | undefined> {
-    const { rows } = await pool.query<OpsLog>("SELECT * FROM logs WHERE id = $1 LIMIT 1", [id]);
+    const { rows } = await pool.query<OpsLog>("SELECT * FROM logs WHERE id = $1 ", [id]);
     return rows[0];
   }
 
@@ -889,7 +531,7 @@ export class DB {
     const placeholders = cols.map((_, i) => `$${i + 1}`).join(",");
     const values = [id, ...LOG_COLS.map((c) => (log as any)[c] ?? null)];
     const { rows } = await pool.query<OpsLog>(
-      `INSERT INTO logs (${cols.join(",")}) VALUES (${placeholders}) RETURNING *`,
+      `INSERT INTO logs (${cols.join(",")}) OUTPUT INSERTED.* VALUES (${placeholders})`,
       values
     );
     return rows[0];
@@ -909,7 +551,7 @@ export class DB {
     values.push(new Date().toISOString());
     if (sets.length === 1) return DB.getLogById(id); // only updated_at → nothing to change
     values.push(id);
-    const { rows } = await pool.query<OpsLog>(`UPDATE logs SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    const { rows } = await pool.query<OpsLog>(`UPDATE logs SET ${sets.join(", ")} OUTPUT INSERTED.* WHERE id = $${idx}`, values);
     return rows[0];
   }
 
@@ -948,7 +590,7 @@ export class DB {
     }
 
     const { rows } = await pool.query<OpsLog>(
-      "UPDATE logs SET duration_seconds = $1, running_since = $2, started_at = $3, status = $4, updated_at = $5 WHERE id = $6 RETURNING *",
+      "UPDATE logs SET duration_seconds = $1, running_since = $2, started_at = $3, status = $4, updated_at = $5 OUTPUT INSERTED.* WHERE id = $6",
       [duration, running_since, started_at, status, nowIso, id]
     );
     return rows[0];
@@ -969,14 +611,14 @@ export class DB {
   }
 
   static async getAssignedTaskById(id: string): Promise<AssignedTask | undefined> {
-    const { rows } = await pool.query<AssignedTask>("SELECT * FROM assigned_tasks WHERE id = $1 LIMIT 1", [id]);
+    const { rows } = await pool.query<AssignedTask>("SELECT * FROM assigned_tasks WHERE id = $1 ", [id]);
     return rows[0];
   }
 
   static async addAssignedTask(t: AssignedTask): Promise<AssignedTask> {
     const { rows } = await pool.query<AssignedTask>(
-      `INSERT INTO assigned_tasks (id, title, description, assigned_by, assigned_by_name, assigned_to, assigned_to_name, department, priority, due_date, status, seen, require_time_entry, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13,$13) RETURNING *`,
+      `INSERT INTO assigned_tasks (id, title, description, assigned_by, assigned_by_name, assigned_to, assigned_to_name, department, priority, due_date, status, seen, require_time_entry, created_at, updated_at) OUTPUT INSERTED.*
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,$12,$13,$13)`,
       [t.id, t.title, t.description ?? null, t.assigned_by, t.assigned_by_name, t.assigned_to, t.assigned_to_name, t.department ?? null, t.priority ?? null, t.due_date ?? null, t.status || "New", (t as any).require_time_entry !== false, t.created_at]
     );
     return rows[0];
@@ -994,17 +636,17 @@ export class DB {
     values.push(new Date().toISOString());
     if (sets.length === 1) return DB.getAssignedTaskById(id);
     values.push(id);
-    const { rows } = await pool.query<AssignedTask>(`UPDATE assigned_tasks SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    const { rows } = await pool.query<AssignedTask>(`UPDATE assigned_tasks SET ${sets.join(", ")} OUTPUT INSERTED.* WHERE id = $${idx}`, values);
     return rows[0];
   }
 
   static async countUnseenTasks(assignedTo: string): Promise<number> {
-    const { rows } = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM assigned_tasks WHERE assigned_to = $1 AND seen = false", [assignedTo]);
+    const { rows } = await pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM assigned_tasks WHERE assigned_to = $1 AND seen = 0", [assignedTo]);
     return Number(rows[0].count);
   }
 
   static async markTasksSeen(assignedTo: string): Promise<void> {
-    await pool.query("UPDATE assigned_tasks SET seen = true WHERE assigned_to = $1 AND seen = false", [assignedTo]);
+    await pool.query("UPDATE assigned_tasks SET seen = 1 WHERE assigned_to = $1 AND seen = 0", [assignedTo]);
   }
 
   static async deleteAssignedTask(id: string): Promise<boolean> {
@@ -1022,13 +664,13 @@ export class DB {
     return rows;
   }
   static async getRecurringTemplateById(id: string): Promise<any | undefined> {
-    const { rows } = await pool.query("SELECT * FROM recurring_templates WHERE id = $1 LIMIT 1", [id]);
+    const { rows } = await pool.query("SELECT * FROM recurring_templates WHERE id = $1 ", [id]);
     return rows[0];
   }
   static async addRecurringTemplate(t: any): Promise<any> {
     const { rows } = await pool.query(
-      `INSERT INTO recurring_templates (id, title, description, department, priority, recurrence_type, days_of_week, due_time, assign_mode, active, created_by, created_by_name, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      `INSERT INTO recurring_templates (id, title, description, department, priority, recurrence_type, days_of_week, due_time, assign_mode, active, created_by, created_by_name, created_at) OUTPUT INSERTED.*
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [t.id, t.title, t.description ?? null, t.department ?? null, t.priority ?? "Medium", t.recurrence_type ?? "daily", t.days_of_week ?? null, t.due_time ?? null, t.assign_mode ?? "pool", t.active ?? true, t.created_by ?? null, t.created_by_name ?? null, t.created_at]
     );
     return rows[0];
@@ -1039,7 +681,7 @@ export class DB {
     for (const c of cols) { if (c in fields && fields[c] !== undefined) { sets.push(`${c} = $${idx++}`); values.push(fields[c]); } }
     if (!sets.length) return DB.getRecurringTemplateById(id);
     values.push(id);
-    const { rows } = await pool.query(`UPDATE recurring_templates SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, values);
+    const { rows } = await pool.query(`UPDATE recurring_templates SET ${sets.join(", ")} OUTPUT INSERTED.* WHERE id = $${idx}`, values);
     return rows[0];
   }
   static async deleteRecurringTemplate(id: string): Promise<boolean> {
@@ -1049,16 +691,21 @@ export class DB {
 
   // Insert a generated recurring instance; idempotent on (template_id, task_date)
   static async addRecurringInstance(t: AssignedTask & { template_id: string; task_date: string }): Promise<AssignedTask | undefined> {
+    // Postgres used `ON CONFLICT (template_id, task_date) DO NOTHING` against a
+    // partial unique index. SQL Server has no ON CONFLICT, so the same
+    // idempotency is expressed as a guarded INSERT. The unique filtered index
+    // (uq_assigned_tasks_template_date in schema.sql) still backstops races: a
+    // concurrent duplicate raises a unique-violation rather than double-inserting.
     const { rows } = await pool.query<AssignedTask>(
-      `INSERT INTO assigned_tasks (id, title, description, assigned_by, assigned_by_name, assigned_to, assigned_to_name, department, priority, due_date, status, seen, template_id, task_date, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13,$14,$14)
-       ON CONFLICT (template_id, task_date) WHERE template_id IS NOT NULL DO NOTHING RETURNING *`,
+      `IF NOT EXISTS (SELECT 1 FROM assigned_tasks WHERE template_id = $12 AND task_date = $13)
+       INSERT INTO assigned_tasks (id, title, description, assigned_by, assigned_by_name, assigned_to, assigned_to_name, department, priority, due_date, status, seen, template_id, task_date, created_at, updated_at) OUTPUT INSERTED.*
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,$12,$13,$14,$14)`,
       [t.id, t.title, t.description ?? null, t.assigned_by, t.assigned_by_name, t.assigned_to ?? null, t.assigned_to_name ?? null, t.department ?? null, t.priority ?? null, t.due_date ?? null, t.status || "Available", t.template_id, t.task_date, t.created_at]
     );
     return rows[0];
   }
   static async recurringInstanceExists(templateId: string, taskDate: string): Promise<boolean> {
-    const { rows } = await pool.query("SELECT 1 FROM assigned_tasks WHERE template_id = $1 AND task_date = $2 LIMIT 1", [templateId, taskDate]);
+    const { rows } = await pool.query("SELECT 1 FROM assigned_tasks WHERE template_id = $1 AND task_date = $2 ", [templateId, taskDate]);
     return rows.length > 0;
   }
 
@@ -1073,7 +720,7 @@ export class DB {
   // Claim a pool task atomically (returns the task if claim succeeded)
   static async claimTask(id: string, userId: string, userName: string): Promise<AssignedTask | undefined> {
     const { rows } = await pool.query<AssignedTask>(
-      "UPDATE assigned_tasks SET assigned_to = $2, assigned_to_name = $3, status = 'New', seen = true, updated_at = $4 WHERE id = $1 AND assigned_to IS NULL RETURNING *",
+      "UPDATE assigned_tasks SET assigned_to = $2, assigned_to_name = $3, status = 'New', seen = 1, updated_at = $4 OUTPUT INSERTED.* WHERE id = $1 AND assigned_to IS NULL",
       [id, userId, userName, new Date().toISOString()]
     );
     return rows[0];
@@ -1081,7 +728,7 @@ export class DB {
   // Count active (non-completed) tasks per agent — for round-robin auto-assign
   static async getOpenTaskCounts(department: string): Promise<Record<string, number>> {
     const { rows } = await pool.query<{ assigned_to: string; c: string }>(
-      "SELECT assigned_to, COUNT(*)::int AS c FROM assigned_tasks WHERE department = $1 AND assigned_to IS NOT NULL AND status <> 'Completed' GROUP BY assigned_to",
+      "SELECT assigned_to, COUNT(*) AS c FROM assigned_tasks WHERE department = $1 AND assigned_to IS NOT NULL AND status <> 'Completed' GROUP BY assigned_to",
       [department]
     );
     const map: Record<string, number> = {};
@@ -1110,7 +757,7 @@ export class DB {
   }
   static async endShiftSession(userId: string, endedAt: string): Promise<void> {
     const { rows } = await pool.query<{ id: string; started_at: string }>(
-      "SELECT id, started_at FROM shift_sessions WHERE user_id = $1 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+      "SELECT id, started_at FROM shift_sessions WHERE user_id = $1 AND ended_at IS NULL ORDER BY started_at DESC ",
       [userId]
     );
     if (!rows.length) return;
@@ -1122,7 +769,7 @@ export class DB {
     if (filter.department) { clauses.push(`department = $${idx++}`); values.push(filter.department); }
     if (filter.user_id) { clauses.push(`user_id = $${idx++}`); values.push(filter.user_id); }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    const { rows } = await pool.query(`SELECT * FROM shift_sessions ${where} ORDER BY started_at DESC LIMIT 500`, values);
+    const { rows } = await pool.query(`SELECT * FROM shift_sessions ${where} ORDER BY started_at DESC `, values);
     return rows;
   }
 
@@ -1135,7 +782,7 @@ export class DB {
   }
 
   static async getInteractionById(id: string): Promise<Interaction | undefined> {
-    const { rows } = await pool.query<Interaction>("SELECT * FROM interactions WHERE id = $1 LIMIT 1", [id]);
+    const { rows } = await pool.query<Interaction>("SELECT * FROM interactions WHERE id = $1 ", [id]);
     return rows[0];
   }
 
@@ -1154,7 +801,7 @@ export class DB {
     }
     if (clauses.length === 0) return [];
     const { rows } = await pool.query<Interaction>(
-      `SELECT * FROM interactions WHERE ${clauses.join(" OR ")} ORDER BY created_at DESC LIMIT 50`,
+      `SELECT * FROM interactions WHERE ${clauses.join(" OR ")} ORDER BY created_at DESC `,
       values
     );
     return rows;
@@ -1163,8 +810,8 @@ export class DB {
   static async addInteraction(interaction: Omit<Interaction, "id"> & { id?: string }): Promise<Interaction> {
     const id = interaction.id || "int-" + Date.now();
     const { rows } = await pool.query<Interaction>(
-      `INSERT INTO interactions (id, interaction_date, interaction_time, agent_id, agent_name, customer_name, customer_phone, interaction_type, communication_type, call_direction, brand, category, call_reason, order_number, branch, team, customer_type, call_from, aggregator_name, comments, complaint_reason, fcr, priority, status, summary, action_taken, follow_up_required, follow_up_date, follow_up_notes, attachments, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31) RETURNING *`,
+      `INSERT INTO interactions (id, interaction_date, interaction_time, agent_id, agent_name, customer_name, customer_phone, interaction_type, communication_type, call_direction, brand, category, call_reason, order_number, branch, team, customer_type, call_from, aggregator_name, comments, complaint_reason, fcr, priority, status, summary, action_taken, follow_up_required, follow_up_date, follow_up_notes, attachments, created_at) OUTPUT INSERTED.*
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`,
       [id, interaction.interaction_date, interaction.interaction_time, interaction.agent_id, interaction.agent_name, interaction.customer_name, interaction.customer_phone, interaction.interaction_type, interaction.communication_type, interaction.call_direction, interaction.brand, interaction.category, interaction.call_reason ?? null, interaction.order_number ?? null, interaction.branch ?? null, interaction.team ?? null, interaction.customer_type ?? null, interaction.call_from ?? null, interaction.aggregator_name ?? null, interaction.comments ?? null, interaction.complaint_reason ?? null, interaction.fcr ?? null, interaction.priority, interaction.status, interaction.summary, interaction.action_taken, interaction.follow_up_required, interaction.follow_up_date ?? null, interaction.follow_up_notes ?? null, JSON.stringify(interaction.attachments ?? []), interaction.created_at]
     );
     return rows[0];
@@ -1189,7 +836,7 @@ export class DB {
 
     values.push(id);
     const { rows } = await pool.query<Interaction>(
-      `UPDATE interactions SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE interactions SET ${sets.join(", ")} OUTPUT INSERTED.* WHERE id = $${idx}`,
       values
     );
     return rows[0];
@@ -1225,14 +872,14 @@ export class DB {
     if (filter.action_status) { clauses.push(`r.action_status = $${idx++}`); values.push(filter.action_status); }
     // Auto-closed rows are report-only — they must never surface in the Reviews list for any role.
     clauses.push(`r.action_status <> 'no_action_needed'`);
-    if (filter.requires_action === true) { clauses.push(`r.requires_action = true`); }
+    if (filter.requires_action === true) { clauses.push(`r.requires_action = 1`); }
     if (filter.assigned === "me" && filter.assigned_agent_id) { clauses.push(`r.assigned_agent_id = $${idx++}`); values.push(filter.assigned_agent_id); }
     else if (filter.assigned === "unassigned") { clauses.push(`r.assigned_agent_id IS NULL`); }
     else if (filter.assigned_agent_id) { clauses.push(`r.assigned_agent_id = $${idx++}`); values.push(filter.assigned_agent_id); }
     if (filter.min_rating != null) { clauses.push(`r.rating >= $${idx++}`); values.push(filter.min_rating); }
     if (filter.max_rating != null) { clauses.push(`r.rating <= $${idx++}`); values.push(filter.max_rating); }
-    if (filter.has_comment === true) { clauses.push(`(r.review_text IS NOT NULL AND btrim(r.review_text) <> '')`); }
-    else if (filter.has_comment === false) { clauses.push(`(r.review_text IS NULL OR btrim(r.review_text) = '')`); }
+    if (filter.has_comment === true) { clauses.push(`(r.review_text IS NOT NULL AND LTRIM(RTRIM(r.review_text)) <> '')`); }
+    else if (filter.has_comment === false) { clauses.push(`(r.review_text IS NULL OR LTRIM(RTRIM(r.review_text)) = '')`); }
     // Filter on the review's own date (order_date, normalised to YYYY-MM-DD on
     // upload), not uploaded_at — a whole batch shares one upload timestamp, so
     // filtering by that would be useless for narrowing down reviews.
@@ -1255,14 +902,14 @@ export class DB {
       LEFT JOIN users ur ON ur.id = r.recorded_by
       ${where}
       ORDER BY r.uploaded_at DESC
-      LIMIT $${idx++} OFFSET $${idx++}
-    `, [...values, lim, off]);
+      OFFSET $${idx++} ROWS FETCH NEXT $${idx++} ROWS ONLY
+    `, [...values, off, lim]);
     return rows;
   }
 
   static async getRatingById(id: string): Promise<any | undefined> {
     const { rows } = await pool.query(`
-      SELECT r.*,
+      SELECT TOP (1) r.*,
         b.brand_name, p.name AS platform_name,
         ua.full_name AS agent_name,
         uu.full_name AS uploaded_by_name,
@@ -1273,7 +920,7 @@ export class DB {
       LEFT JOIN users ua ON ua.id = r.assigned_agent_id
       LEFT JOIN users uu ON uu.id = r.uploaded_by
       LEFT JOIN users ur ON ur.id = r.recorded_by
-      WHERE r.id = $1 LIMIT 1
+      WHERE r.id = $1
     `, [id]);
     if (!rows[0]) return undefined;
     const attempts = await pool.query(`
@@ -1294,27 +941,42 @@ export class DB {
     served_by?: string; note?: string; assigned_agent_id?: string | null;
   }, mode: "skip" | "overwrite"): Promise<"inserted" | "skipped" | "overwritten"> {
     const id = "rat-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+    // The natural key is (brand_id, platform_id, order_id) — enforced by
+    // uq_ratings_brand_platform_order in schema.sql. SQL Server has no
+    // ON CONFLICT, so both branches are written as an explicit existence check.
+    const params = [id,data.brand_id,data.platform_id,data.order_id,data.rating,data.review_text||null,data.customer_phone||null,data.requires_action,data.action_status,data.uploaded_by,data.order_date||null,data.customer_name||null,data.branch||null,data.filled_by||null,data.following_date||null,data.surveyed_by||null,data.complaint_type||null,data.complaint_cases||null,data.complaint_status||null,data.served_by||null,data.note||null,data.assigned_agent_id??null];
+
     if (mode === "skip") {
       const res = await pool.query(`
+        IF NOT EXISTS (SELECT 1 FROM ratings WHERE brand_id = $2 AND platform_id = $3 AND order_id = $4)
         INSERT INTO ratings (id,brand_id,platform_id,order_id,rating,review_text,customer_phone,requires_action,action_status,uploaded_by,uploaded_at,order_date,customer_name,branch,filled_by,following_date,surveyed_by,complaint_type,complaint_cases,complaint_status,served_by,note,assigned_agent_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-        ON CONFLICT (brand_id,platform_id,order_id) DO NOTHING
-      `, [id,data.brand_id,data.platform_id,data.order_id,data.rating,data.review_text||null,data.customer_phone||null,data.requires_action,data.action_status,data.uploaded_by,data.order_date||null,data.customer_name||null,data.branch||null,data.filled_by||null,data.following_date||null,data.surveyed_by||null,data.complaint_type||null,data.complaint_cases||null,data.complaint_status||null,data.served_by||null,data.note||null,data.assigned_agent_id??null]);
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,SYSDATETIMEOFFSET(),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+      `, params);
       return (res.rowCount ?? 0) > 0 ? "inserted" : "skipped";
     } else {
-      const res = await pool.query(`
-        INSERT INTO ratings (id,brand_id,platform_id,order_id,rating,review_text,customer_phone,requires_action,action_status,uploaded_by,uploaded_at,order_date,customer_name,branch,filled_by,following_date,surveyed_by,complaint_type,complaint_cases,complaint_status,served_by,note,assigned_agent_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-        ON CONFLICT (brand_id,platform_id,order_id) DO UPDATE SET
-          rating=EXCLUDED.rating,review_text=EXCLUDED.review_text,customer_phone=EXCLUDED.customer_phone,
-          requires_action=EXCLUDED.requires_action,action_status=EXCLUDED.action_status,
-          uploaded_by=EXCLUDED.uploaded_by,uploaded_at=now(),
-          order_date=EXCLUDED.order_date,customer_name=EXCLUDED.customer_name,branch=EXCLUDED.branch,
-          filled_by=EXCLUDED.filled_by,following_date=EXCLUDED.following_date,surveyed_by=EXCLUDED.surveyed_by,
-          complaint_type=EXCLUDED.complaint_type,complaint_cases=EXCLUDED.complaint_cases,
-          complaint_status=EXCLUDED.complaint_status,served_by=EXCLUDED.served_by,note=EXCLUDED.note
-        RETURNING (xmax = 0) AS inserted
-      `, [id,data.brand_id,data.platform_id,data.order_id,data.rating,data.review_text||null,data.customer_phone||null,data.requires_action,data.action_status,data.uploaded_by,data.order_date||null,data.customer_name||null,data.branch||null,data.filled_by||null,data.following_date||null,data.surveyed_by||null,data.complaint_type||null,data.complaint_cases||null,data.complaint_status||null,data.served_by||null,data.note||null,data.assigned_agent_id??null]);
+      // Mirrors the Postgres DO UPDATE list exactly — note assigned_agent_id is
+      // deliberately NOT overwritten, so a re-upload never unassigns an agent.
+      const res = await pool.query<{ inserted: number }>(`
+        IF EXISTS (SELECT 1 FROM ratings WHERE brand_id = $2 AND platform_id = $3 AND order_id = $4)
+        BEGIN
+          UPDATE ratings SET
+            rating=$5,review_text=$6,customer_phone=$7,
+            requires_action=$8,action_status=$9,
+            uploaded_by=$10,uploaded_at=SYSDATETIMEOFFSET(),
+            order_date=$11,customer_name=$12,branch=$13,
+            filled_by=$14,following_date=$15,surveyed_by=$16,
+            complaint_type=$17,complaint_cases=$18,
+            complaint_status=$19,served_by=$20,note=$21
+          WHERE brand_id = $2 AND platform_id = $3 AND order_id = $4;
+          SELECT 0 AS inserted;
+        END
+        ELSE
+        BEGIN
+          INSERT INTO ratings (id,brand_id,platform_id,order_id,rating,review_text,customer_phone,requires_action,action_status,uploaded_by,uploaded_at,order_date,customer_name,branch,filled_by,following_date,surveyed_by,complaint_type,complaint_cases,complaint_status,served_by,note,assigned_agent_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,SYSDATETIMEOFFSET(),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22);
+          SELECT 1 AS inserted;
+        END
+      `, params);
       return res.rows[0]?.inserted ? "inserted" : "overwritten";
     }
   }
@@ -1346,7 +1008,7 @@ export class DB {
     const closingStatuses = ["resolved", "no_action_needed", "unreachable"];
     const res = await pool.query(
       closingStatuses.includes(actionStatus)
-        ? `UPDATE ratings SET action_status = $1, resolved_at = COALESCE(resolved_at, now()) WHERE id = ANY($2)`
+        ? `UPDATE ratings SET action_status = $1, resolved_at = COALESCE(resolved_at, SYSDATETIMEOFFSET()) WHERE id = ANY($2)`
         : `UPDATE ratings SET action_status = $1 WHERE id = ANY($2)`,
       [actionStatus, ids]
     );
@@ -1361,7 +1023,7 @@ export class DB {
 
   static async countRatingsUploadedBetween(fromISO: string, toISO: string): Promise<number> {
     const { rows } = await pool.query<{ c: string }>(
-      "SELECT COUNT(*)::int AS c FROM ratings WHERE uploaded_at >= $1 AND uploaded_at <= $2", [fromISO, toISO]);
+      "SELECT COUNT(*) AS c FROM ratings WHERE uploaded_at >= $1 AND uploaded_at <= $2", [fromISO, toISO]);
     return Number(rows[0]?.c || 0);
   }
 
@@ -1374,12 +1036,12 @@ export class DB {
   static async addCallAttempt(data: {
     rating_id: string; agent_id: string; agent_name: string; outcome: string; note?: string;
   }): Promise<any> {
-    const cnt = await pool.query<{ count: string }>("SELECT COUNT(*)::int AS count FROM rating_call_attempts WHERE rating_id = $1", [data.rating_id]);
+    const cnt = await pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM rating_call_attempts WHERE rating_id = $1", [data.rating_id]);
     const n = Number(cnt.rows[0].count) + 1;
     const id = "att-" + Date.now() + "-" + Math.floor(Math.random() * 999);
     const { rows } = await pool.query(`
-      INSERT INTO rating_call_attempts (id,rating_id,agent_id,agent_name,attempt_number,outcome,note,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING *
+      INSERT INTO rating_call_attempts (id,rating_id,agent_id,agent_name,attempt_number,outcome,note,created_at) OUTPUT INSERTED.*
+      VALUES ($1,$2,$3,$4,$5,$6,$7,SYSDATETIMEOFFSET())
     `, [id, data.rating_id, data.agent_id, data.agent_name, n, data.outcome, data.note || null]);
     return rows[0];
   }
@@ -1390,7 +1052,7 @@ export class DB {
   static async getSurveyTemplates(): Promise<any[]> {
     const { rows } = await pool.query(`
       SELECT t.*, b.brand_name, u.full_name AS created_by_name,
-        (SELECT COUNT(*)::int FROM survey_questions q WHERE q.template_id = t.id) AS question_count
+        (SELECT COUNT(*) FROM survey_questions q WHERE q.template_id = t.id) AS question_count
       FROM survey_templates t
       LEFT JOIN brands b ON b.id = t.brand_id
       LEFT JOIN users u ON u.id = t.created_by
@@ -1401,11 +1063,11 @@ export class DB {
 
   static async getSurveyTemplateById(id: string): Promise<any | undefined> {
     const { rows } = await pool.query(`
-      SELECT t.*, b.brand_name, u.full_name AS created_by_name
+      SELECT TOP (1) t.*, b.brand_name, u.full_name AS created_by_name
       FROM survey_templates t
       LEFT JOIN brands b ON b.id = t.brand_id
       LEFT JOIN users u ON u.id = t.created_by
-      WHERE t.id = $1 LIMIT 1
+      WHERE t.id = $1
     `, [id]);
     if (!rows[0]) return undefined;
     const q = await pool.query("SELECT * FROM survey_questions WHERE template_id = $1 ORDER BY q_order ASC", [id]);
@@ -1421,7 +1083,7 @@ export class DB {
       await client.query("BEGIN");
       const id = "st-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
       await client.query(
-        "INSERT INTO survey_templates (id,name,brand_id,created_by,active,created_at) VALUES ($1,$2,$3,$4,$5,now())",
+        "INSERT INTO survey_templates (id,name,brand_id,created_by,active,created_at) VALUES ($1,$2,$3,$4,$5,SYSDATETIMEOFFSET())",
         [id, data.name, data.brand_id || null, data.created_by, data.active !== false]
       );
       for (let i = 0; i < data.questions.length; i++) {
@@ -1482,8 +1144,8 @@ export class DB {
     const { rows } = await pool.query(`
       SELECT c.*, b.brand_name, t.name AS template_name, u.full_name AS requested_by_name,
         da.full_name AS default_agent_name,
-        (SELECT COUNT(*)::int FROM survey_assignments a WHERE a.campaign_id = c.id) AS total_numbers,
-        (SELECT COUNT(*)::int FROM survey_assignments a WHERE a.campaign_id = c.id AND a.status = 'successful') AS done_numbers
+        (SELECT COUNT(*) FROM survey_assignments a WHERE a.campaign_id = c.id) AS total_numbers,
+        (SELECT COUNT(*) FROM survey_assignments a WHERE a.campaign_id = c.id AND a.status = 'successful') AS done_numbers
       FROM survey_campaigns c
       LEFT JOIN brands b ON b.id = c.brand_id
       LEFT JOIN survey_templates t ON t.id = c.template_id
@@ -1496,14 +1158,14 @@ export class DB {
 
   static async getSurveyCampaignById(id: string): Promise<any | undefined> {
     const { rows } = await pool.query(`
-      SELECT c.*, b.brand_name, t.name AS template_name, u.full_name AS requested_by_name,
+      SELECT TOP (1) c.*, b.brand_name, t.name AS template_name, u.full_name AS requested_by_name,
         da.full_name AS default_agent_name
       FROM survey_campaigns c
       LEFT JOIN brands b ON b.id = c.brand_id
       LEFT JOIN survey_templates t ON t.id = c.template_id
       LEFT JOIN users u ON u.id = c.requested_by
       LEFT JOIN users da ON da.id = c.default_agent_id
-      WHERE c.id = $1 LIMIT 1
+      WHERE c.id = $1
     `, [id]);
     return rows[0];
   }
@@ -1517,7 +1179,7 @@ export class DB {
     const id = "sc-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
     await pool.query(`
       INSERT INTO survey_campaigns (id,brand_id,requested_by,requester_role,template_id,survey_type,assignment_mode,continuity_type,requested_count,duration_days,status,default_agent_id,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,now())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,SYSDATETIMEOFFSET())
     `, [id, data.brand_id || null, data.requested_by, data.requester_role || null, data.template_id || null, data.survey_type, data.assignment_mode, data.continuity_type, data.requested_count, data.duration_days, data.default_agent_id || null]);
     return DB.getSurveyCampaignById(id);
   }
@@ -1532,8 +1194,8 @@ export class DB {
   // ----------------------------------------------------
   static async wasRecentlyContacted(brandId: string | null, phone: string, days: number): Promise<boolean> {
     const { rows } = await pool.query(
-      `SELECT 1 FROM customer_contacts WHERE phone_number = $1 AND ($2::text IS NULL OR brand_id = $2)
-         AND last_contacted_at > now() - ($3 || ' days')::interval LIMIT 1`,
+      `SELECT TOP (1) 1 FROM customer_contacts WHERE phone_number = $1 AND ($2 IS NULL OR brand_id = $2)
+         AND last_contacted_at > DATEADD(day, -CAST($3 AS INT), SYSDATETIMEOFFSET()) `,
       [phone, brandId, String(days)]
     );
     return rows.length > 0;
@@ -1541,8 +1203,8 @@ export class DB {
 
   static async isPhoneQueued(brandId: string | null, phone: string): Promise<boolean> {
     const { rows } = await pool.query(
-      `SELECT 1 FROM survey_assignments WHERE customer_phone = $1 AND ($2::text IS NULL OR brand_id = $2)
-         AND status IN ('pending','in_progress') LIMIT 1`,
+      `SELECT TOP (1) 1 FROM survey_assignments WHERE customer_phone = $1 AND ($2 IS NULL OR brand_id = $2)
+         AND status IN ('pending','in_progress') `,
       [phone, brandId]
     );
     return rows.length > 0;
@@ -1551,8 +1213,8 @@ export class DB {
   // Current pending counts per scheduled_date from today forward
   static async getPendingCountsByDate(): Promise<Map<string, number>> {
     const { rows } = await pool.query<{ d: string; c: string }>(
-      `SELECT to_char(scheduled_date,'YYYY-MM-DD') AS d, COUNT(*)::int AS c
-       FROM survey_assignments WHERE status = 'pending' AND scheduled_date >= CURRENT_DATE
+      `SELECT CONVERT(varchar(10), scheduled_date, 23) AS d, COUNT(*) AS c
+       FROM survey_assignments WHERE status = 'pending' AND scheduled_date >= CAST(SYSDATETIMEOFFSET() AS DATE)
        GROUP BY scheduled_date`
     );
     const m = new Map<string, number>();
@@ -1570,7 +1232,7 @@ export class DB {
         const id = "sasg-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
         await client.query(
           `INSERT INTO survey_assignments (id,campaign_id,brand_id,customer_phone,assigned_agent_id,attempt_count,status,scheduled_date,segment,created_at)
-           VALUES ($1,$2,$3,$4,$5,0,'pending',$6,$7,now())`,
+           VALUES ($1,$2,$3,$4,$5,0,'pending',$6,$7,SYSDATETIMEOFFSET())`,
           [id, a.campaign_id, a.brand_id, a.customer_phone, a.assigned_agent_id, a.scheduled_date, a.segment || null]
         );
       }
@@ -1585,16 +1247,24 @@ export class DB {
   }
 
   static async getToday(): Promise<string> {
-    const { rows } = await pool.query<{ d: string }>("SELECT to_char(CURRENT_DATE,'YYYY-MM-DD') AS d");
+    // style 23 = ISO yyyy-mm-dd, the T-SQL equivalent of to_char(…,'YYYY-MM-DD')
+    const { rows } = await pool.query<{ d: string }>(
+      "SELECT CONVERT(varchar(10), CAST(SYSDATETIMEOFFSET() AS DATE), 23) AS d"
+    );
     return rows[0].d;
   }
 
   static async getDailyCapacity(days: number, limit: number): Promise<{ date: string; used: number; limit: number }[]> {
     const counts = await DB.getPendingCountsByDate();
-    const { rows } = await pool.query<{ d: string }>(
-      `SELECT to_char(CURRENT_DATE + g, 'YYYY-MM-DD') AS d FROM generate_series(0, $1) g`,
-      [days - 1]
-    );
+    // SQL Server has no generate_series, so the day offsets are built in JS
+    // from the server's own "today" (keeping the same timezone reference).
+    const today = await DB.getToday();
+    const base = new Date(today + "T00:00:00Z");
+    const rows = Array.from({ length: days }, (_, g) => {
+      const d = new Date(base);
+      d.setUTCDate(d.getUTCDate() + g);
+      return { d: d.toISOString().slice(0, 10) };
+    });
     return rows.map((r) => ({ date: r.d, used: counts.get(r.d) || 0, limit }));
   }
 
@@ -1603,30 +1273,30 @@ export class DB {
   // ----------------------------------------------------
   static async getSurveyQueue(userId: string): Promise<any[]> {
     const { rows } = await pool.query(`
-      SELECT a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, b.brand_name,
+      SELECT TOP (300) a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, b.brand_name,
         t.name AS template_name
       FROM survey_assignments a
       JOIN survey_campaigns c ON c.id = a.campaign_id
       LEFT JOIN brands b ON b.id = a.brand_id
       LEFT JOIN survey_templates t ON t.id = c.template_id
-      WHERE a.status = 'pending' AND a.scheduled_date <= CURRENT_DATE AND c.status = 'active'
+      WHERE a.status = 'pending' AND a.scheduled_date <= CAST(SYSDATETIMEOFFSET() AS DATE) AND c.status = 'active'
         AND ( a.assigned_agent_id = $1 OR (c.assignment_mode = 'open' AND a.assigned_agent_id IS NULL) )
       ORDER BY a.scheduled_date ASC, a.created_at ASC
-      LIMIT 300
+
     `, [userId]);
     return rows;
   }
 
   static async getSurveyAssignmentById(id: string): Promise<any | undefined> {
     const { rows } = await pool.query(`
-      SELECT a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, c.status AS campaign_status,
+      SELECT TOP (1) a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, c.status AS campaign_status,
         b.brand_name, t.name AS template_name, ag.full_name AS agent_name
       FROM survey_assignments a
       JOIN survey_campaigns c ON c.id = a.campaign_id
       LEFT JOIN brands b ON b.id = a.brand_id
       LEFT JOIN survey_templates t ON t.id = c.template_id
       LEFT JOIN users ag ON ag.id = a.assigned_agent_id
-      WHERE a.id = $1 LIMIT 1
+      WHERE a.id = $1
     `, [id]);
     if (!rows[0]) return undefined;
     const questions = rows[0].template_id
@@ -1645,27 +1315,27 @@ export class DB {
     const n = (asg.attempt_count || 0) + 1;
     const id = "scatt-" + Date.now() + "-" + Math.floor(Math.random() * 999);
     const { rows } = await pool.query(
-      `INSERT INTO survey_call_attempts (id,assignment_id,agent_id,attempt_number,outcome,note,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,now()) RETURNING *`,
+      `INSERT INTO survey_call_attempts (id,assignment_id,agent_id,attempt_number,outcome,note,created_at) OUTPUT INSERTED.*
+       VALUES ($1,$2,$3,$4,$5,$6,SYSDATETIMEOFFSET())`,
       [id, data.assignment_id, data.agent_id, n, data.outcome, data.note || null]
     );
 
     // Determine new status
     const sets: string[] = ["attempt_count = $1"]; const vals: any[] = [n]; let idx = 2;
     let newStatus = "in_progress";
-    let becameNotReached = false;
+    let becameNotReached = 0;
     if (data.outcome === "declined") {
       newStatus = "declined";
-      becameNotReached = true;
+      becameNotReached = 1;
     } else if (data.outcome !== "answered" && n >= 3) {
       if (asg.continuity_type === "continuous") {
         // Reschedule to next day, reset attempts, keep pending
         newStatus = "pending";
         sets[0] = "attempt_count = 0";
-        sets.push(`scheduled_date = CURRENT_DATE + 1`);
+        sets.push(`scheduled_date = DATEADD(day, 1, CAST(SYSDATETIMEOFFSET() AS DATE))`);
       } else {
         newStatus = "unreachable";
-        becameNotReached = true;
+        becameNotReached = 1;
       }
     }
     sets.push(`status = $${idx++}`); vals.push(newStatus);
@@ -1673,7 +1343,7 @@ export class DB {
     if (becameNotReached) {
       sets.push(`reachability = 'not_reached'`);
       sets.push(`action_type = 'no_action'`);
-      sets.push(`completed_at = now()`);
+      sets.push(`completed_at = SYSDATETIMEOFFSET()`);
     }
     vals.push(data.assignment_id);
     await pool.query(`UPDATE survey_assignments SET ${sets.join(",")} WHERE id = $${idx}`, vals);
@@ -1684,7 +1354,7 @@ export class DB {
       const srid = "srec-" + Date.now() + "-" + Math.floor(Math.random() * 99999);
       await pool.query(
         `INSERT INTO survey_records (id,record_type,brand_id,brand_label,phone,served_by,answered,note,extra,record_date,uploaded_by,created_at)
-         VALUES ($1,'survey_live',$2,$3,$4,$5,false,'no_action',$6, to_char(now() + interval '3 hours','YYYY-MM-DD'),$7, now())`,
+         VALUES ($1,'survey_live',$2,$3,$4,$5,0,'no_action',$6, CONVERT(varchar(10), DATEADD(hour, 3, SYSDATETIMEOFFSET()), 23),$7, SYSDATETIMEOFFSET())`,
         [srid, asg.brand_id || null, asg.brand_name || null, asg.customer_phone || null, agentName,
          JSON.stringify({ reachability: "not_reached", action_type: "no_action", campaign_id: asg.campaign_id, outcome: data.outcome }), data.agent_id]
       );
@@ -1708,7 +1378,7 @@ export class DB {
       const asg = await DB.getSurveyAssignmentById(data.assignment_id);
       const rid = "sresp-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
       await client.query(
-        "INSERT INTO survey_responses (id,assignment_id,agent_id,answered_at) VALUES ($1,$2,$3,now())",
+        "INSERT INTO survey_responses (id,assignment_id,agent_id,answered_at) VALUES ($1,$2,$3,SYSDATETIMEOFFSET())",
         [rid, data.assignment_id, data.agent_id]
       );
       // Derive a headline rate + comment for the Survey Data record from the answers
@@ -1740,7 +1410,7 @@ export class DB {
       // Terminal status: successful when reached, unreachable when not
       const newStatus = answered ? "successful" : "unreachable";
       await client.query(
-        "UPDATE survey_assignments SET status = $2, reachability = $3, action_type = $4, completed_at = now() WHERE id = $1",
+        "UPDATE survey_assignments SET status = $2, reachability = $3, action_type = $4, completed_at = SYSDATETIMEOFFSET() WHERE id = $1",
         [data.assignment_id, newStatus, reachability, action_type]
       );
       // Mirror the outcome into Survey Data (survey_records) so it shows in reports/history
@@ -1749,16 +1419,22 @@ export class DB {
       const srid = "srec-" + Date.now() + "-" + Math.floor(Math.random() * 99999);
       await client.query(
         `INSERT INTO survey_records (id,record_type,brand_id,brand_label,phone,served_by,rate,answered,comment,complaint,note,segment,extra,record_date,uploaded_by,created_at)
-         VALUES ($1,'survey_live',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, to_char(now() + interval '3 hours','YYYY-MM-DD'), $13, now())`,
+         VALUES ($1,'survey_live',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, CONVERT(varchar(10), DATEADD(hour, 3, SYSDATETIMEOFFSET()), 23), $13, SYSDATETIMEOFFSET())`,
         [srid, data.brand_id, asg?.brand_name || null, data.customer_phone, agentName, rate, answered,
          comment, complaint, action_type, data.segment || null, JSON.stringify({ reachability, action_type, segment: data.segment || null, campaign_id: asg?.campaign_id, template: asg?.template_name }), data.agent_id]
       );
       // Update contact recency
       const ccid = "cc-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+      // Upsert on (brand_id, phone_number). Written as an explicit
+      // update-then-insert because SQL Server has no ON CONFLICT; the
+      // uq_cc_brand_phone filtered index still guards against races.
       await client.query(
-        `INSERT INTO customer_contacts (id,brand_id,phone_number,last_contacted_at,last_contacted_brand_id)
-         VALUES ($1,$2,$3,now(),$2)
-         ON CONFLICT (brand_id,phone_number) DO UPDATE SET last_contacted_at = now(), last_contacted_brand_id = EXCLUDED.brand_id`,
+        `UPDATE customer_contacts
+           SET last_contacted_at = SYSDATETIMEOFFSET(), last_contacted_brand_id = $2
+         WHERE brand_id = $2 AND phone_number = $3;
+         IF @@ROWCOUNT = 0
+         INSERT INTO customer_contacts (id,brand_id,phone_number,last_contacted_at,last_contacted_brand_id)
+         VALUES ($1,$2,$3,SYSDATETIMEOFFSET(),$2)`,
         [ccid, data.brand_id, data.customer_phone]
       );
       await client.query("COMMIT");
@@ -1795,24 +1471,24 @@ export class DB {
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const CAP = 1000;
     const { rows } = await pool.query(`
-      SELECT a.*, b.brand_name, u.full_name AS agent_name, c.assignment_mode, t.name AS template_name
+      SELECT TOP (${CAP}) a.*, b.brand_name, u.full_name AS agent_name, c.assignment_mode, t.name AS template_name
       FROM survey_assignments a
       LEFT JOIN brands b ON b.id = a.brand_id
       LEFT JOIN users u ON u.id = a.assigned_agent_id
       LEFT JOIN survey_campaigns c ON c.id = a.campaign_id
       LEFT JOIN survey_templates t ON t.id = c.template_id
       ${where}
-      ORDER BY a.created_at DESC LIMIT ${CAP}
+      ORDER BY a.created_at DESC
     `, values);
-    const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS total FROM survey_assignments a ${where}`, values);
+    const { rows: cnt } = await pool.query(`SELECT COUNT(*) AS total FROM survey_assignments a ${where}`, values);
     return { records: rows, total: cnt[0]?.total ?? rows.length, cap: CAP };
   }
 
   static async getCampaignAssignments(campaignId: string): Promise<any[]> {
     const { rows } = await pool.query(`
-      SELECT a.*, u.full_name AS agent_name FROM survey_assignments a
+      SELECT TOP (500) a.*, u.full_name AS agent_name FROM survey_assignments a
       LEFT JOIN users u ON u.id = a.assigned_agent_id
-      WHERE a.campaign_id = $1 ORDER BY a.created_at ASC LIMIT 500
+      WHERE a.campaign_id = $1 ORDER BY a.created_at ASC
     `, [campaignId]);
     return rows;
   }
@@ -1820,8 +1496,8 @@ export class DB {
   // Manually assign N unassigned pending numbers of a campaign to an agent
   static async assignCampaignNumbers(campaignId: string, agentId: string, count: number): Promise<number> {
     const { rows } = await pool.query(
-      `SELECT id FROM survey_assignments WHERE campaign_id = $1 AND assigned_agent_id IS NULL AND status = 'pending'
-       ORDER BY created_at ASC LIMIT $2`,
+      `SELECT TOP ($2) id FROM survey_assignments WHERE campaign_id = $1 AND assigned_agent_id IS NULL AND status = 'pending'
+       ORDER BY created_at ASC `,
       [campaignId, count]
     );
     if (!rows.length) return 0;
@@ -1841,7 +1517,7 @@ export class DB {
 
   static async countTodaySuccess(userId: string): Promise<number> {
     const { rows } = await pool.query<{ c: string }>(
-      `SELECT COUNT(*)::int AS c FROM survey_responses WHERE agent_id = $1 AND answered_at::date = CURRENT_DATE`,
+      `SELECT COUNT(*) AS c FROM survey_responses WHERE agent_id = $1 AND CAST(answered_at AS DATE) = CAST(SYSDATETIMEOFFSET() AS DATE)`,
       [userId]
     );
     return Number(rows[0]?.c || 0);
@@ -1860,7 +1536,7 @@ export class DB {
         const id = "srec-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
         await client.query(`
           INSERT INTO survey_records (id,record_type,brand_id,brand_label,platform_id,platform_label,order_id,phone,customer_name,item_name,rate,product_feedback,served_by,answered,customer_suggestion,comment,complaint,note,trials,segment,extra,record_date,uploaded_by,created_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,now())
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,SYSDATETIMEOFFSET())
         `, [id, r.record_type, r.brand_id || null, r.brand_label || null, r.platform_id || null, r.platform_label || null,
             r.order_id || null, r.phone || null, r.customer_name || null, r.item_name || null,
             r.rate ?? null, r.product_feedback || null, r.served_by || null, !!r.answered,
@@ -1889,15 +1565,15 @@ export class DB {
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const LIST_CAP = 1000;
     const { rows } = await pool.query(`
-      SELECT r.*, b.brand_name, p.name AS platform_name, u.full_name AS uploaded_by_name
+      SELECT TOP (${LIST_CAP}) r.*, b.brand_name, p.name AS platform_name, u.full_name AS uploaded_by_name
       FROM survey_records r
       LEFT JOIN brands b ON b.id = r.brand_id
       LEFT JOIN platforms p ON p.id = r.platform_id
       LEFT JOIN users u ON u.id = r.uploaded_by
       ${where}
-      ORDER BY r.created_at DESC LIMIT ${LIST_CAP}
+      ORDER BY r.created_at DESC
     `, values);
-    const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS total FROM survey_records r ${where}`, values);
+    const { rows: cnt } = await pool.query(`SELECT COUNT(*) AS total FROM survey_records r ${where}`, values);
     return { records: rows, total: cnt[0]?.total ?? rows.length, cap: LIST_CAP };
   }
 
@@ -1937,54 +1613,54 @@ export class DB {
   static async getFeedbackDashboard(fromISO: string | null, toISO: string | null): Promise<any> {
     const dr = [fromISO, toISO];
     const q = (sql: string) => pool.query(sql, dr);
-    const rW = `($1::timestamptz IS NULL OR r.uploaded_at >= $1) AND ($2::timestamptz IS NULL OR r.uploaded_at <= $2)`;
-    const tW = `($1::timestamptz IS NULL OR created_at >= $1) AND ($2::timestamptz IS NULL OR created_at <= $2)`;
+    const rW = `($1 IS NULL OR r.uploaded_at >= $1) AND ($2 IS NULL OR r.uploaded_at <= $2)`;
+    const tW = `($1 IS NULL OR created_at >= $1) AND ($2 IS NULL OR created_at <= $2)`;
 
     // ---- Ratings / Reviews ----
-    const rTot = (await q(`SELECT COUNT(*)::int total, COALESCE(ROUND(AVG(rating)::numeric,2),0)::float avg_rating,
-        SUM(CASE WHEN requires_action THEN 1 ELSE 0 END)::int needs_action,
-        SUM(CASE WHEN action_status IN ('resolved','no_action_needed') THEN 1 ELSE 0 END)::int resolved,
-        SUM(CASE WHEN action_status='unreachable' THEN 1 ELSE 0 END)::int unreachable
+    const rTot = (await q(`SELECT COUNT(*) total, COALESCE(ROUND(AVG(CAST(rating AS FLOAT)),2),0) avg_rating,
+        SUM(CASE WHEN requires_action = 1 THEN 1 ELSE 0 END) needs_action,
+        SUM(CASE WHEN action_status IN ('resolved','no_action_needed') THEN 1 ELSE 0 END) resolved,
+        SUM(CASE WHEN action_status='unreachable' THEN 1 ELSE 0 END) unreachable
       FROM ratings r WHERE ${rW}`)).rows[0];
-    const rByStatus = (await q(`SELECT action_status name, COUNT(*)::int count FROM ratings r WHERE ${rW} GROUP BY action_status ORDER BY count DESC`)).rows;
-    const rByRating = (await q(`SELECT rating::text name, COUNT(*)::int count FROM ratings r WHERE ${rW} GROUP BY rating ORDER BY rating`)).rows;
-    const rByBrand = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*)::int count FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC LIMIT 8`)).rows;
-    const rByPlatform = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*)::int count FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC LIMIT 8`)).rows;
+    const rByStatus = (await q(`SELECT action_status name, COUNT(*) count FROM ratings r WHERE ${rW} GROUP BY action_status ORDER BY count DESC`)).rows;
+    const rByRating = (await q(`SELECT CAST(rating AS NVARCHAR(10)) name, COUNT(*) count FROM ratings r WHERE ${rW} GROUP BY rating ORDER BY rating`)).rows;
+    const rByBrand = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*) count FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC `)).rows;
+    const rByPlatform = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*) count FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC `)).rows;
     // Avg rating per platform / per brand (spec §6)
-    const platformPerf = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*)::int count, COALESCE(ROUND(AVG(rating)::numeric,2),0)::float avg FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC LIMIT 10`)).rows;
-    const brandPerf = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*)::int count, COALESCE(ROUND(AVG(rating)::numeric,2),0)::float avg FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC LIMIT 10`)).rows;
-    const rByAgent = (await q(`SELECT ua.full_name name, COUNT(*)::int assigned,
-        SUM(CASE WHEN r.action_status IN ('resolved','no_action_needed','unreachable') THEN 1 ELSE 0 END)::int done
+    const platformPerf = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*) count, COALESCE(ROUND(AVG(CAST(rating AS FLOAT)),2),0) avg FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC `)).rows;
+    const brandPerf = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*) count, COALESCE(ROUND(AVG(CAST(rating AS FLOAT)),2),0) avg FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC `)).rows;
+    const rByAgent = (await q(`SELECT TOP (10) ua.full_name name, COUNT(*) assigned,
+        SUM(CASE WHEN r.action_status IN ('resolved','no_action_needed','unreachable') THEN 1 ELSE 0 END) done
       FROM ratings r JOIN users ua ON ua.id=r.assigned_agent_id WHERE ${rW} AND r.assigned_agent_id IS NOT NULL
-      GROUP BY ua.full_name ORDER BY assigned DESC LIMIT 10`)).rows;
+      GROUP BY ua.full_name ORDER BY assigned DESC `)).rows;
 
     // ---- Surveys ----
-    const campTotal = (await q(`SELECT COUNT(*)::int c FROM survey_campaigns WHERE ${tW}`)).rows[0].c;
-    const campByStatus = (await q(`SELECT status name, COUNT(*)::int count FROM survey_campaigns WHERE ${tW} GROUP BY status ORDER BY count DESC`)).rows;
-    const asgTot = (await q(`SELECT COUNT(*)::int total,
-        SUM(CASE WHEN status='successful' THEN 1 ELSE 0 END)::int successful
+    const campTotal = (await q(`SELECT COUNT(*) c FROM survey_campaigns WHERE ${tW}`)).rows[0].c;
+    const campByStatus = (await q(`SELECT status name, COUNT(*) count FROM survey_campaigns WHERE ${tW} GROUP BY status ORDER BY count DESC`)).rows;
+    const asgTot = (await q(`SELECT COUNT(*) total,
+        SUM(CASE WHEN status='successful' THEN 1 ELSE 0 END) successful
       FROM survey_assignments WHERE ${tW}`)).rows[0];
-    const asgByStatus = (await q(`SELECT status name, COUNT(*)::int count FROM survey_assignments WHERE ${tW} GROUP BY status ORDER BY count DESC`)).rows;
-    const recTot = (await q(`SELECT COUNT(*)::int total,
-        SUM(CASE WHEN answered THEN 1 ELSE 0 END)::int answered,
-        SUM(CASE WHEN NOT answered THEN 1 ELSE 0 END)::int no_answer
+    const asgByStatus = (await q(`SELECT status name, COUNT(*) count FROM survey_assignments WHERE ${tW} GROUP BY status ORDER BY count DESC`)).rows;
+    const recTot = (await q(`SELECT COUNT(*) total,
+        SUM(CASE WHEN answered = 1 THEN 1 ELSE 0 END) answered,
+        SUM(CASE WHEN answered = 0 THEN 1 ELSE 0 END) no_answer
       FROM survey_records WHERE ${tW}`)).rows[0];
-    const recByType = (await q(`SELECT record_type name, COUNT(*)::int count FROM survey_records WHERE ${tW} GROUP BY record_type ORDER BY count DESC`)).rows;
-    const recByBrand = (await q(`SELECT COALESCE(b.brand_name, sr.brand_label, '—') name, COUNT(*)::int count
+    const recByType = (await q(`SELECT record_type name, COUNT(*) count FROM survey_records WHERE ${tW} GROUP BY record_type ORDER BY count DESC`)).rows;
+    const recByBrand = (await q(`SELECT TOP (8) COALESCE(b.brand_name, sr.brand_label, '—') name, COUNT(*) count
       FROM survey_records sr LEFT JOIN brands b ON b.id=sr.brand_id
-      WHERE ($1::timestamptz IS NULL OR sr.created_at >= $1) AND ($2::timestamptz IS NULL OR sr.created_at <= $2)
-      GROUP BY COALESCE(b.brand_name, sr.brand_label, '—') ORDER BY count DESC LIMIT 8`)).rows;
-    const surveyTopAgents = (await q(`SELECT u.full_name name, COUNT(*)::int successful
+      WHERE ($1 IS NULL OR sr.created_at >= $1) AND ($2 IS NULL OR sr.created_at <= $2)
+      GROUP BY COALESCE(b.brand_name, sr.brand_label, '—') ORDER BY count DESC `)).rows;
+    const surveyTopAgents = (await q(`SELECT TOP (10) u.full_name name, COUNT(*) successful
       FROM survey_responses resp JOIN users u ON u.id=resp.agent_id
-      WHERE ($1::timestamptz IS NULL OR resp.answered_at >= $1) AND ($2::timestamptz IS NULL OR resp.answered_at <= $2)
-      GROUP BY u.full_name ORDER BY successful DESC LIMIT 10`)).rows;
+      WHERE ($1 IS NULL OR resp.answered_at >= $1) AND ($2 IS NULL OR resp.answered_at <= $2)
+      GROUP BY u.full_name ORDER BY successful DESC `)).rows;
     // Survey records per employee (Served By) — includes historical imports.
-    const recByAgent = (await q(`SELECT COALESCE(NULLIF(TRIM(served_by),''),'—') name,
-        COUNT(*)::int count,
-        SUM(CASE WHEN answered THEN 1 ELSE 0 END)::int answered,
-        COALESCE(ROUND(AVG(rate)::numeric,2),0)::float avg
+    const recByAgent = (await q(`SELECT TOP (30) COALESCE(NULLIF(TRIM(served_by),''),'—') name,
+        COUNT(*) count,
+        SUM(CASE WHEN answered = 1 THEN 1 ELSE 0 END) answered,
+        COALESCE(ROUND(AVG(CAST(rate AS FLOAT)),2),0) avg
       FROM survey_records WHERE ${tW} GROUP BY COALESCE(NULLIF(TRIM(served_by),''),'—')
-      ORDER BY count DESC LIMIT 30`)).rows;
+      ORDER BY count DESC `)).rows;
 
     return {
       ratings: {
