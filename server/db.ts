@@ -177,7 +177,7 @@ export class DB {
     // Ensure the "Quality" department option exists even on databases whose
     // department list was seeded before Quality was added
     await pool.query(
-      "INSERT INTO options (id, list_key, label, sort_order, active) SELECT 'opt-department-quality', 'department', 'Quality', 99, true WHERE NOT EXISTS (SELECT 1 FROM options WHERE list_key = 'department' AND label = 'Quality')"
+      "INSERT INTO options (id, list_key, label, sort_order, active) SELECT 'opt-department-quality', 'department', 'Quality', 99, 1 WHERE NOT EXISTS (SELECT 1 FROM options WHERE list_key = 'department' AND label = 'Quality')"
     );
 
     // Backfill teams for rows created before the feature existed
