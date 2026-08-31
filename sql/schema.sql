@@ -564,4 +564,16 @@ IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.survey
   ALTER TABLE dbo.survey_assignments ADD task_no INT IDENTITY(1,1) NOT NULL;
 GO
 
+-- order_number was miscategorized as a short/indexed-style column
+-- (NVARCHAR(100)) during the original port, but it is neither a primary key,
+-- a foreign key, nor part of any index/constraint on either table — it
+-- should have followed the "free text" rule (NVARCHAR(MAX)) like the
+-- PostgreSQL source column (plain TEXT, no length limit). Found because a
+-- real migrated row in `logs` exceeded 100 characters and failed to insert.
+-- ALTER COLUMN is safe here: nothing indexes or constrains this column.
+ALTER TABLE dbo.logs ALTER COLUMN order_number NVARCHAR(MAX) NULL;
+GO
+ALTER TABLE dbo.interactions ALTER COLUMN order_number NVARCHAR(MAX) NULL;
+GO
+
 PRINT 'Call_Reason schema created (23 tables).';
