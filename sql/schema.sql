@@ -564,16 +564,88 @@ IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.survey
   ALTER TABLE dbo.survey_assignments ADD task_no INT IDENTITY(1,1) NOT NULL;
 GO
 
--- order_number was miscategorized as a short/indexed-style column
--- (NVARCHAR(100)) during the original port, but it is neither a primary key,
--- a foreign key, nor part of any index/constraint on either table — it
--- should have followed the "free text" rule (NVARCHAR(MAX)) like the
--- PostgreSQL source column (plain TEXT, no length limit). Found because a
--- real migrated row in `logs` exceeded 100 characters and failed to insert.
--- ALTER COLUMN is safe here: nothing indexes or constrains this column.
+-- order_number (and, found by the same audit below, a batch of similar
+-- columns) was miscategorized as a short/indexed-style column (NVARCHAR(n))
+-- during the original port, but none of them are a primary key, a foreign
+-- key, or part of any index/constraint — they should have followed the
+-- "free text" rule (NVARCHAR(MAX)) like their PostgreSQL source column
+-- (plain TEXT, no length limit). Found because real migrated rows in `logs`
+-- exceeded the declared length and failed to insert with a cryptic TDS-level
+-- error rather than a clear truncation message.
+-- ALTER COLUMN is safe for every column below: none of them are indexed,
+-- constrained, or part of a foreign key.
 ALTER TABLE dbo.logs ALTER COLUMN order_number NVARCHAR(MAX) NULL;
-GO
 ALTER TABLE dbo.interactions ALTER COLUMN order_number NVARCHAR(MAX) NULL;
+GO
+
+-- Same audit, applied schema-wide: every other NVARCHAR(n) column that is
+-- free-form/externally-sourced data (Excel uploads, agent-entered text) and
+-- not part of a PK/FK/UNIQUE/INDEX. Enum-like columns (status, role,
+-- priority, survey_type, etc. — controlled entirely by application code, a
+-- small fixed set of short values) are deliberately left as-is.
+ALTER TABLE dbo.users ALTER COLUMN username NVARCHAR(MAX) NOT NULL;
+ALTER TABLE dbo.users ALTER COLUMN email NVARCHAR(MAX) NOT NULL;
+ALTER TABLE dbo.users ALTER COLUMN job_title NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.users ALTER COLUMN team NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.users ALTER COLUMN department NVARCHAR(MAX) NULL;
+GO
+
+ALTER TABLE dbo.brands ALTER COLUMN brand_name NVARCHAR(MAX) NOT NULL;
+ALTER TABLE dbo.categories ALTER COLUMN category_name NVARCHAR(MAX) NOT NULL;
+ALTER TABLE dbo.branches ALTER COLUMN branch_name NVARCHAR(MAX) NOT NULL;
+ALTER TABLE dbo.branches ALTER COLUMN brand NVARCHAR(MAX) NULL;
+GO
+
+ALTER TABLE dbo.interactions ALTER COLUMN interaction_type NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN communication_type NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN brand NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN category NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN call_reason NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN branch NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN team NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN customer_type NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN call_from NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN aggregator_name NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.interactions ALTER COLUMN complaint_reason NVARCHAR(MAX) NULL;
+GO
+
+ALTER TABLE dbo.audit_logs ALTER COLUMN category NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.audit_logs ALTER COLUMN [action] NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.audit_logs ALTER COLUMN related_ref NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.audit_logs ALTER COLUMN department NVARCHAR(MAX) NULL;
+GO
+
+ALTER TABLE dbo.options ALTER COLUMN label NVARCHAR(MAX) NOT NULL;
+ALTER TABLE dbo.assigned_tasks ALTER COLUMN department NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.recurring_templates ALTER COLUMN department NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.shift_sessions ALTER COLUMN department NVARCHAR(MAX) NULL;
+GO
+
+ALTER TABLE dbo.logs ALTER COLUMN department NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.logs ALTER COLUMN activity_type NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.logs ALTER COLUMN branch NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.logs ALTER COLUMN brand NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.logs ALTER COLUMN aggregator NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.logs ALTER COLUMN complaint_id NVARCHAR(MAX) NULL;
+GO
+
+ALTER TABLE dbo.ratings ALTER COLUMN branch NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.ratings ALTER COLUMN filled_by NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.ratings ALTER COLUMN surveyed_by NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.ratings ALTER COLUMN complaint_type NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.ratings ALTER COLUMN complaint_status NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.ratings ALTER COLUMN served_by NVARCHAR(MAX) NULL;
+GO
+
+-- survey_records.order_id has no uniqueness constraint on this table (unlike
+-- ratings.order_id, which is part of a real UNIQUE constraint and stays
+-- capped), so it is safe to widen too.
+ALTER TABLE dbo.survey_records ALTER COLUMN brand_label NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.survey_records ALTER COLUMN platform_label NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.survey_records ALTER COLUMN order_id NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.survey_records ALTER COLUMN product_feedback NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.survey_records ALTER COLUMN served_by NVARCHAR(MAX) NULL;
+ALTER TABLE dbo.survey_records ALTER COLUMN trials NVARCHAR(MAX) NULL;
 GO
 
 PRINT 'Call_Reason schema created (23 tables).';
