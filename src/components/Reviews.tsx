@@ -984,7 +984,7 @@ export default function Reviews({ currentUser }: ReviewsProps) {
                       </div>
                     )}
 
-                    {(detail.attempts || []).length < 3 && !isDone(detail.action_status) && (
+                    {(detail.attempts || []).length < 3 && !isDone(detail.action_status) && currentUser.role !== 'marketing' && (
                       <div className="p-4 bg-[var(--bg)] border border-[var(--border)] rounded-2xl space-y-3">
                         <p className="text-[11px] font-bold text-[var(--text)]">Log New Attempt</p>
                         <select
@@ -1017,7 +1017,7 @@ export default function Reviews({ currentUser }: ReviewsProps) {
                   </div>
 
                   {/* Action section */}
-                  {!isDone(detail.action_status) && (
+                  {!isDone(detail.action_status) && currentUser.role !== 'marketing' && (
                     <div className="space-y-3 border-t border-[var(--border)] pt-4">
                       <p className="text-xs font-extrabold text-[var(--heading)]">Action</p>
                       <textarea

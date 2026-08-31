@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { User, SurveyTemplate, SurveyQuestion, AnswerType, Brand, SURVEY_SEGMENTS } from "../types.js";
 import { apiFetch } from "../lib/api.ts";
 import {
-  ClipboardList, RefreshCw, Plus, X, AlertCircle, Trash2,
+  ClipboardList, RefreshCw, Plus, X, AlertCircle, Trash2, Download, Lock, Copy,
 } from "lucide-react";
 
 interface SurveyTemplatesProps { currentUser: User; }
@@ -18,7 +18,11 @@ const fmtDate = (ts?: string) => {
 const inputCls = "px-3 py-2.5 bg-[var(--bg)] text-[var(--heading)] border border-[var(--border)] rounded-xl text-xs focus:ring-1 focus:ring-blue-500 focus:outline-none";
 const selCls = inputCls + " font-bold [&>option]:bg-[var(--surface)]";
 
-interface QRow { text: string; answer_type: AnswerType; optionsText: string; segment: string; }
+// `id` is only set for a question that already exists in the database — it
+// lets the save request update that row in place instead of the backend
+// treating every question as brand new, which would sever already-recorded
+// answers from the question they were for.
+interface QRow { id?: string; text: string; answer_type: AnswerType; optionsText: string; segment: string; }
 
 export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
   const [templates, setTemplates] = useState<SurveyTemplate[]>([]);
@@ -37,6 +41,61 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
   const [modalError, setModalError] = useState("");
 
   const canManage = ['admin', 'manager', 'supervisor', 'leader'].includes(currentUser.role);
+  const [exportingId, setExportingId] = useState<string | null>(null);
+
+  // Downloads every recorded answer for this template as one CSV: one row per
+  // respondent, one column per question, in the template's question order.
+  const exportTemplate = async (t: SurveyTemplate) => {
+    setExportingId(t.id);
+    try {
+      const res = await apiFetch(`/api/survey-templates/${t.id}/export`);
+      if (!res.ok) { const d = await res.json().catch(() => ({})); setError(d.error || "Export failed."); return; }
+      const data: {
+        questions: { id: string; text: string; q_order: number }[];
+        answers: { response_id: string; customer_phone: string; agent_name: string | null;
+          answered_at: string; brand_name: string | null; segment: string | null;
+          question_id: string; answer_value: string | null }[];
+      } = await res.json();
+
+      const questions = [...data.questions].sort((a, b) => a.q_order - b.q_order);
+      const byResponse = new Map<string, {
+        customer_phone: string; agent_name: string | null; answered_at: string;
+        brand_name: string | null; segment: string | null; answers: Record<string, string>;
+      }>();
+      for (const a of data.answers) {
+        let row = byResponse.get(a.response_id);
+        if (!row) {
+          row = { customer_phone: a.customer_phone, agent_name: a.agent_name, answered_at: a.answered_at, brand_name: a.brand_name, segment: a.segment, answers: {} };
+          byResponse.set(a.response_id, row);
+        }
+        row.answers[a.question_id] = a.answer_value || "";
+      }
+
+      const esc = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const header = ["Phone", "Brand", "Segment", "Agent", "Completed At", ...questions.map(q => q.text)];
+      const lines = [header.map(esc).join(",")];
+      for (const row of byResponse.values()) {
+        const cells = [
+          row.customer_phone, row.brand_name || "", row.segment || "", row.agent_name || "",
+          fmtDate(row.answered_at), ...questions.map(q => row.answers[q.id] ?? ""),
+        ];
+        lines.push(cells.map(esc).join(","));
+      }
+      if (byResponse.size === 0) { setError("No completed responses to export yet."); return; }
+
+      const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${t.name.replace(/[^a-z0-9]+/gi, "-")}-responses-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setError(e.message || "Export error.");
+    } finally {
+      setExportingId(null);
+    }
+  };
 
   const fetchTemplates = useCallback(async () => {
     setLoading(true);
@@ -72,6 +131,13 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
   };
 
   const openEdit = async (t: SurveyTemplate) => {
+    // Real survey answers already exist under this template — editing it is
+    // blocked server-side too, but stopping here avoids the modal opening
+    // just to fail on save.
+    if (t.has_data) {
+      alert(`"${t.name}" already has recorded survey answers and can no longer be edited.\nCreate a new template instead — it will keep this one's history intact.`);
+      return;
+    }
     resetModal();
     setEditId(t.id);
     setName(t.name);
@@ -85,6 +151,7 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
         const qs: SurveyQuestion[] = data.questions || [];
         if (qs.length) {
           setRows(qs.map(q => ({
+            id: q.id,
             text: q.text || "",
             answer_type: q.answer_type,
             optionsText: (q.options || []).join(", "),
@@ -94,6 +161,40 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
       }
     } finally {
       setModalLoading(false);
+    }
+  };
+
+  const [copyingId, setCopyingId] = useState<string | null>(null);
+
+  // Duplicate a template's questions into a brand-new (unlocked, empty)
+  // template — none of the original's recorded answers come along, since
+  // this creates a fresh template with fresh question ids.
+  const copyTemplate = async (t: SurveyTemplate) => {
+    resetModal();
+    setName(`${t.name} (Copy)`);
+    setBrandId(t.brand_id || "");
+    setShowModal(true);
+    setModalLoading(true);
+    setCopyingId(t.id);
+    try {
+      const res = await apiFetch(`/api/survey-templates/${t.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        const qs: SurveyQuestion[] = data.questions || [];
+        if (qs.length) {
+          setRows(qs.map(q => ({
+            text: q.text || "",
+            answer_type: q.answer_type,
+            optionsText: (q.options || []).join(", "),
+            segment: q.segment || "",
+          })));
+        }
+      } else {
+        setModalError("Failed to load the template to copy.");
+      }
+    } finally {
+      setModalLoading(false);
+      setCopyingId(null);
     }
   };
 
@@ -108,7 +209,12 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
     const cleaned = rows.filter(r => r.text.trim());
     if (cleaned.length === 0) { setModalError("Add at least one question."); return; }
     const questions = cleaned.map((r, i) => {
+      // Carry the existing id along so the backend updates this question in
+      // place instead of treating it as new — that keeps already-recorded
+      // answers linked to it. A row with no id (freshly added here) is a new
+      // question and gets a new id server-side.
       const q: any = { text: r.text.trim(), answer_type: r.answer_type, q_order: i + 1, segment: r.segment || null };
+      if (r.id) q.id = r.id;
       if (r.answer_type === 'multiple_choice') {
         q.options = r.optionsText.split(',').map(s => s.trim()).filter(Boolean);
       }
@@ -189,6 +295,7 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
                   <th className="p-4">Status</th>
                   <th className="p-4">Created By</th>
                   <th className="p-4">Created</th>
+                  <th className="p-4 text-center">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--border)]">
@@ -196,9 +303,15 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
                   <tr
                     key={t.id}
                     onClick={() => canManage && openEdit(t)}
-                    className={`transition align-middle ${canManage ? 'hover:bg-[var(--surface-2)]/40 cursor-pointer' : ''}`}
+                    title={t.has_data ? 'Locked — this template already has recorded survey answers' : undefined}
+                    className={`transition align-middle ${canManage ? 'hover:bg-[var(--surface-2)]/40 cursor-pointer' : ''} ${t.has_data ? 'opacity-80' : ''}`}
                   >
-                    <td className="p-4 font-bold text-[var(--heading)]">{t.name}</td>
+                    <td className="p-4 font-bold text-[var(--heading)]">
+                      <span className="inline-flex items-center gap-1.5">
+                        {t.has_data && <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
+                        {t.name}
+                      </span>
+                    </td>
                     <td className="p-4 text-[var(--text)]">
                       {t.brand_name || <span className="text-[var(--muted)]">General</span>}
                     </td>
@@ -214,11 +327,33 @@ export default function SurveyTemplates({ currentUser }: SurveyTemplatesProps) {
                     </td>
                     <td className="p-4 text-[var(--muted)]">{t.created_by_name || '—'}</td>
                     <td className="p-4 font-mono text-[11px] text-[var(--muted)] whitespace-nowrap">{fmtDate(t.created_at)}</td>
+                    <td className="p-4 text-center">
+                      <div className="flex items-center justify-center gap-2">
+                        {canManage && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); copyTemplate(t); }}
+                            disabled={copyingId === t.id}
+                            title="Duplicate this template's questions into a new, empty template"
+                            className="px-3 py-1.5 bg-violet-500/10 hover:bg-violet-500/20 disabled:opacity-50 text-violet-400 border border-violet-500/20 rounded-lg text-[10px] font-bold inline-flex items-center gap-1.5 transition active:scale-95"
+                          >
+                            <Copy className="w-3.5 h-3.5" /> {copyingId === t.id ? 'Copying…' : 'Copy'}
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); exportTemplate(t); }}
+                          disabled={exportingId === t.id}
+                          title="Export this survey's questions and answers to CSV"
+                          className="px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-50 text-emerald-400 border border-emerald-500/20 rounded-lg text-[10px] font-bold inline-flex items-center gap-1.5 transition active:scale-95"
+                        >
+                          <Download className="w-3.5 h-3.5" /> {exportingId === t.id ? 'Exporting…' : 'Export'}
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
                 {templates.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="p-8 text-center text-[var(--muted)]">No templates found.</td>
+                    <td colSpan={7} className="p-8 text-center text-[var(--muted)]">No templates found.</td>
                   </tr>
                 )}
               </tbody>

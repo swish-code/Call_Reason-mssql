@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { User } from "../types.js";
 import { apiFetch } from "../lib/api.ts";
-import { Star, MessageSquare, ClipboardList, CheckCircle2, AlertCircle, Users, Filter, X, PhoneCall, Flag, Megaphone, ThumbsUp } from "lucide-react";
+import { Star, MessageSquare, ClipboardList, CheckCircle2, AlertCircle, Users, Filter, X, PhoneCall, Flag, Megaphone, ThumbsUp, ChevronRight } from "lucide-react";
 
 interface Props { currentUser: User; }
 type NC = { name: string; count: number };
@@ -12,6 +12,7 @@ interface FeedbackData {
     byStatus: NC[]; byRating: NC[]; byBrand: NC[]; byPlatform: NC[];
     platformPerf: { name: string; count: number; avg: number }[];
     brandPerf: { name: string; count: number; avg: number }[];
+    brandBranchPerf?: { brand: string; name: string; count: number; avg: number }[];
     byAgent: { name: string; assigned: number; done: number }[];
   };
   surveys: {
@@ -38,6 +39,8 @@ export default function FeedbackDashboard({ currentUser }: Props) {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [activePeriod, setActivePeriod] = useState<"today" | "week" | "month" | "">("");
+  // Which brand row is expanded to show its branches (one at a time).
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   const kwToday = () => new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
   const kwWeekStart = () => { const k = new Date(Date.now() + 3 * 3600 * 1000); k.setUTCDate(k.getUTCDate() - k.getUTCDay()); return k.toISOString().slice(0, 10); };
@@ -98,8 +101,18 @@ export default function FeedbackDashboard({ currentUser }: Props) {
     );
   };
 
-  const PerfTable = ({ title, icon: Icon, rows }: { title: string; icon: any; rows: { name: string; count: number; avg: number }[] }) => {
-    const starColor = (a: number) => a >= 4 ? 'text-emerald-400' : a >= 3 ? 'text-amber-400' : 'text-rose-400';
+  const starColor = (a: number) => a >= 4 ? 'text-emerald-400' : a >= 3 ? 'text-amber-400' : 'text-rose-400';
+
+  /**
+   * When `subRows` is supplied, each row becomes expandable and reveals its
+   * own breakdown (brand -> its branches) inline underneath.
+   */
+  const PerfTable = ({ title, icon: Icon, rows, subRows }: {
+    title: string; icon: any; rows: { name: string; count: number; avg: number }[];
+    subRows?: { brand: string; name: string; count: number; avg: number }[];
+  }) => {
+    const expandable = !!subRows?.length;
+    const kidsOf = (brand: string) => (subRows || []).filter((c) => c.brand === brand);
     return (
       <div className="bg-[var(--surface)] p-6 border border-[var(--border)] shadow-lg rounded-2xl">
         <h3 className="text-sm font-bold text-[var(--heading)] mb-4 flex items-center gap-2"><Icon className="w-4 h-4 text-blue-400" /> {title}</h3>
@@ -107,13 +120,37 @@ export default function FeedbackDashboard({ currentUser }: Props) {
           <table className="w-full text-xs">
             <thead><tr className="text-[10px] text-[var(--muted)] font-bold border-b border-[var(--border)]"><th className="text-left py-2">Name</th><th className="text-center py-2">Reviews</th><th className="text-center py-2">Avg</th></tr></thead>
             <tbody>
-              {rows.map((x) => (
-                <tr key={x.name} className="border-b border-[var(--border)]/40 last:border-0">
-                  <td className="py-2 font-bold text-[var(--heading)] truncate max-w-[160px]">{x.name}</td>
-                  <td className="py-2 text-center font-mono text-[var(--muted)]">{x.count}</td>
-                  <td className={`py-2 text-center font-mono font-bold ${starColor(x.avg)}`}>{x.avg ? `${x.avg.toFixed(1)} ★` : '—'}</td>
-                </tr>
-              ))}
+              {rows.map((x) => {
+                const kids = expandable ? kidsOf(x.name) : [];
+                const open = expanded === x.name;
+                return (
+                  <React.Fragment key={x.name}>
+                    <tr
+                      className={`border-b border-[var(--border)]/40 ${kids.length ? 'cursor-pointer hover:bg-[var(--surface-2)]/40' : ''} transition`}
+                      onClick={kids.length ? () => setExpanded(open ? null : x.name) : undefined}
+                      title={kids.length ? (open ? 'Hide branches' : 'Show branches') : undefined}
+                    >
+                      <td className="py-2 font-bold text-[var(--heading)] truncate max-w-[160px]">
+                        <span className="inline-flex items-center gap-1.5">
+                          {kids.length > 0 && (
+                            <ChevronRight className={`w-3.5 h-3.5 text-[var(--muted)] shrink-0 transition-transform ${open ? 'rotate-90' : ''}`} />
+                          )}
+                          {x.name}
+                        </span>
+                      </td>
+                      <td className="py-2 text-center font-mono text-[var(--muted)]">{x.count}</td>
+                      <td className={`py-2 text-center font-mono font-bold ${starColor(x.avg)}`}>{x.avg ? `${x.avg.toFixed(1)} ★` : '—'}</td>
+                    </tr>
+                    {open && kids.map((k) => (
+                      <tr key={`${x.name}|${k.name}`} className="border-b border-[var(--border)]/30 bg-[var(--surface-2)]/30">
+                        <td className="py-1.5 pl-6 text-[var(--text)] truncate max-w-[160px]">↳ {k.name}</td>
+                        <td className="py-1.5 text-center font-mono text-[var(--muted)]">{k.count}</td>
+                        <td className={`py-1.5 text-center font-mono ${starColor(k.avg)}`}>{k.avg ? `${k.avg.toFixed(1)} ★` : '—'}</td>
+                      </tr>
+                    ))}
+                  </React.Fragment>
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -170,7 +207,7 @@ export default function FeedbackDashboard({ currentUser }: Props) {
           <Bar title="By Rating (stars)" data={r.byRating} color="bg-amber-500" icon={Star} label={(n) => `${n} ★`} />
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <PerfTable title="Avg Rating by Brand" icon={Megaphone} rows={r.brandPerf} />
+          <PerfTable title="Avg Rating by Brand" icon={Megaphone} rows={r.brandPerf} subRows={r.brandBranchPerf} />
           <PerfTable title="Avg Rating by Platform" icon={MessageSquare} rows={r.platformPerf} />
         </div>
         {/* Agent workload */}

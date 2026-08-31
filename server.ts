@@ -39,6 +39,69 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // ----------------------------------------------------
+// Universal action log — every add/edit/delete, for every endpoint,
+// forever. This is deliberately generic rather than a per-route call
+// (the codebase already had ~15 hand-placed DB.addAuditLog calls, which only
+// covers a fraction of what mutates data — any endpoint someone forgets to
+// instrument is invisible). A single request-level hook can't be forgotten:
+// it fires for every successful POST/PUT/PATCH/DELETE regardless of which
+// route handled it, including ones added after this was written.
+//
+// It is registered before any route, but the actual logging happens on
+// res.on('finish') — by then the route's own middleware (authenticateJWT)
+// has already run on this same `req` object and set req.user, and the
+// response body/status are known. GET requests are not logged (pure reads
+// are not "actions"), and failed requests (4xx/5xx) are not logged (nothing
+// was actually written).
+const AUDIT_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const SENSITIVE_BODY_KEYS = new Set([
+  "password", "password_hash", "current_password", "new_password", "token",
+]);
+
+function summarizeBody(body: any): string {
+  if (!body || typeof body !== "object") return "";
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(body)) {
+    if (SENSITIVE_BODY_KEYS.has(k)) { parts.push(`${k}=***`); continue; }
+    if (v == null) continue;
+    const s = typeof v === "string" ? v : JSON.stringify(v);
+    // Base64 file uploads and long blobs would otherwise flood every entry.
+    parts.push(`${k}=${s.length > 120 ? s.slice(0, 120) + "…" : s}`);
+  }
+  return parts.join(", ");
+}
+
+// First path segment after /api/ — a stable, low-maintenance category that
+// covers every current and future route without a lookup table to keep in sync.
+function categoryFromPath(p: string): string {
+  const m = p.match(/^\/api\/([^/]+)/);
+  if (!m) return "System";
+  return m[1].split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+app.use((req: any, res: any, next: any) => {
+  res.on("finish", () => {
+    try {
+      if (!AUDIT_METHODS.has(req.method)) return;
+      if (res.statusCode >= 400) return; // failed writes changed nothing
+      if (!req.user) return; // unauthenticated route (e.g. login itself)
+      void DB.addAuditLog({
+        operator_id: req.user.id,
+        operator_name: req.user.full_name,
+        operator_role: req.user.role,
+        department: req.user.department || undefined,
+        category: categoryFromPath(req.path),
+        action: `${req.method} ${req.path}`,
+        details: summarizeBody(req.body),
+        related_ref: req.params?.id || undefined,
+        ip_address: req.ip,
+      }).catch(() => {});
+    } catch { /* logging must never affect the real request */ }
+  });
+  next();
+});
+
+// ----------------------------------------------------
 // Authentication & JWT Security Support
 // ----------------------------------------------------
 const JWT_SECRET = process.env.JWT_SECRET || "crm-system-super-secret-key-2026";
@@ -84,19 +147,19 @@ const requireManagerOrAdmin = (req: any, res: any, next: any) => {
   }
 };
 
-// GET /api/users: leaders, supervisors, managers, admins (agents excluded)
+// GET /api/users: leaders, supervisors, managers, admins (agents and marketing excluded)
 const requireLeaderManagerOrAdmin = (req: any, res: any, next: any) => {
   const r = req.user?.role;
-  if (r && r !== "agent") {
+  if (r && r !== "agent" && r !== "marketing") {
     next();
   } else {
     res.status(403).json({ error: "Access denied." });
   }
 };
 
-// Any manager (Team Leader, Supervisor, or Admin) — i.e. not an agent
+// Any manager (Team Leader, Supervisor, or Admin) — i.e. not an agent or marketing (view-only)
 const requireManager = (req: any, res: any, next: any) => {
-  if (req.user && req.user.role !== "agent") {
+  if (req.user && req.user.role !== "agent" && req.user.role !== "marketing") {
     next();
   } else {
     res.status(403).json({ error: "Sorry, this action is restricted to Team Leaders, Supervisors, or Admins." });
@@ -375,6 +438,49 @@ app.put("/api/users/:id/reset-password", authenticateJWT, requireAdmin, asyncHan
   });
 
   res.json({ message: "Password reset successfully." });
+}));
+
+/**
+ * Self-service password change — any signed-in user, for their own account only.
+ *
+ * The current password is required and verified server-side: the JWT alone is
+ * not sufficient proof, since a token left behind on an unattended machine
+ * would otherwise be enough to lock the real owner out of their account.
+ */
+app.post("/api/me/change-password", authenticateJWT, asyncHandler(async (req: any, res) => {
+  const { current_password, new_password } = req.body;
+
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: "Current and new password are both required." });
+  }
+  if (String(new_password).length < 6) {
+    return res.status(400).json({ error: "New password must be at least 6 characters." });
+  }
+  if (current_password === new_password) {
+    return res.status(400).json({ error: "The new password must be different from the current one." });
+  }
+
+  // Always read the stored hash fresh — never trust a password state carried in the token.
+  const user = await DB.getUserById(req.user.id);
+  if (!user) return res.status(404).json({ error: "User not found." });
+
+  if (!bcrypt.compareSync(current_password, user.password_hash)) {
+    return res.status(400).json({ error: "Your current password is incorrect." });
+  }
+
+  await DB.updateUser(req.user.id, { password_hash: bcrypt.hashSync(new_password, 10) });
+
+  // Record that it happened, but never the password itself.
+  await DB.addAuditLog({
+    operator_id: user.id,
+    operator_name: user.full_name,
+    operator_role: user.role,
+    category: "Account",
+    action: "Password Changed",
+    details: `${user.username} changed their own password.`,
+  });
+
+  res.json({ message: "Password changed successfully." });
 }));
 
 // Audit Logs list API
@@ -910,6 +1016,7 @@ app.get("/api/logs/history", authenticateJWT, requireLeaderOrAdmin, asyncHandler
 }));
 
 app.post("/api/logs", authenticateJWT, asyncHandler(async (req: any, res: any) => {
+  if (req.user.role === "marketing") return res.status(403).json({ error: "Access denied." });
   const { role, id, full_name, department } = req.user;
   const body = req.body;
   if (!body.activity_type) return res.status(400).json({ error: "Activity type is required." });
@@ -2004,6 +2111,7 @@ app.get("/api/ratings/:id", authenticateJWT, asyncHandler(async (req: any, res) 
 
 // Patch rating (status / note / assignment / customer contact)
 app.patch("/api/ratings/:id", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (req.user.role === "marketing") return res.status(403).json({ error: "Access denied." });
   const rating = await DB.getRatingById(req.params.id);
   if (!rating) return res.status(404).json({ error: "Rating not found." });
   // Agents may only edit reviews assigned to them
@@ -2035,6 +2143,7 @@ app.patch("/api/ratings/:id", authenticateJWT, asyncHandler(async (req: any, res
 
 // Log a call attempt (max 3)
 app.post("/api/ratings/:id/attempts", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (req.user.role === "marketing") return res.status(403).json({ error: "Access denied." });
   const rating = await DB.getRatingById(req.params.id);
   if (!rating) return res.status(404).json({ error: "Rating not found." });
   const attemptsCount = (rating.attempts || []).length;
@@ -2215,6 +2324,17 @@ app.get("/api/survey-templates/:id", authenticateJWT, asyncHandler(async (req, r
   res.json(t);
 }));
 
+// Export data for a template: its questions + every recorded answer, for the
+// frontend to pivot into one row per respondent / one column per question.
+app.get("/api/survey-templates/:id/export", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (!canBuildTemplates(req.user.role)) return res.status(403).json({ error: "Access denied." });
+  try {
+    res.json(await DB.getTemplateExportRows(req.params.id));
+  } catch (e: any) {
+    res.status(404).json({ error: e.message || "Template not found." });
+  }
+}));
+
 app.post("/api/survey-templates", authenticateJWT, asyncHandler(async (req: any, res) => {
   if (!canBuildTemplates(req.user.role)) return res.status(403).json({ error: "Access denied." });
   const { name, brand_id, active, questions } = req.body;
@@ -2226,9 +2346,14 @@ app.post("/api/survey-templates", authenticateJWT, asyncHandler(async (req: any,
 
 app.put("/api/survey-templates/:id", authenticateJWT, asyncHandler(async (req: any, res) => {
   if (!canBuildTemplates(req.user.role)) return res.status(403).json({ error: "Access denied." });
-  const t = await DB.updateSurveyTemplate(req.params.id, req.body);
-  if (!t) return res.status(404).json({ error: "Template not found." });
-  res.json(t);
+  try {
+    const t = await DB.updateSurveyTemplate(req.params.id, req.body);
+    if (!t) return res.status(404).json({ error: "Template not found." });
+    res.json(t);
+  } catch (e: any) {
+    // templateHasRecordedData guard throws a plain Error with a user-facing message.
+    res.status(400).json({ error: e.message || "Failed to update template." });
+  }
 }));
 
 // ---- Campaigns ----
@@ -2347,6 +2472,13 @@ app.get("/api/surveys/agents", authenticateJWT, asyncHandler(async (_req, res) =
   res.json(await DB.getSurveyAgents());
 }));
 
+// Survey agents with their current workload — lets whoever is assigning see how
+// loaded each agent already is, instead of distributing blind.
+app.get("/api/surveys/agents/workload", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (!isLeaderLevel(req.user.role)) return res.status(403).json({ error: "Access denied." });
+  res.json(await DB.getSurveyAgentWorkload());
+}));
+
 // The current user's work queue for today
 app.get("/api/surveys/queue", authenticateJWT, asyncHandler(async (req: any, res) => {
   const queue = await DB.getSurveyQueue(req.user.id);
@@ -2363,6 +2495,7 @@ app.get("/api/surveys/assignments/:id", authenticateJWT, asyncHandler(async (req
 
 // Log a call attempt on an assignment (max 3)
 app.post("/api/surveys/assignments/:id/attempt", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (req.user.role === "marketing") return res.status(403).json({ error: "Access denied." });
   const a = await DB.getSurveyAssignmentById(req.params.id);
   if (!a) return res.status(404).json({ error: "Assignment not found." });
   if ((a.attempt_count || 0) >= 3) return res.status(400).json({ error: "Maximum 3 attempts reached." });
@@ -2372,36 +2505,60 @@ app.post("/api/surveys/assignments/:id/attempt", authenticateJWT, asyncHandler(a
   res.json(out);
 }));
 
-// Record an outcome: Reached (with answers) or Not Reached (No Action)
+// Record an outcome: Reached + completed (with answers), Reached but declined
+// (Refused to Complete / Not Interested — no answers needed), or Not Reached (No Action)
 app.post("/api/surveys/assignments/:id/response", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (req.user.role === "marketing") return res.status(403).json({ error: "Access denied." });
   const a = await DB.getSurveyAssignmentById(req.params.id);
   if (!a) return res.status(404).json({ error: "Assignment not found." });
-  const { answers, reachability, action_type, segment } = req.body;
+  const { answers, reachability, action_type, segment, outcome } = req.body;
   const notReached = reachability === "not_reached";
-  if (!notReached) {
+  const declined = !notReached && (outcome === "refused" || outcome === "not_interested");
+  // Only a genuine completed survey requires actual answers — a customer who
+  // refused or wasn't interested was reached, but has nothing to answer.
+  if (!notReached && !declined) {
     if (!Array.isArray(answers) || answers.length === 0) return res.status(400).json({ error: "Answers are required." });
     const anyAnswered = answers.some((x: any) => x.answered && String(x.answer_value ?? "").trim() !== "");
     if (!anyAnswered) return res.status(400).json({ error: "At least one question must be answered." });
   }
   const updated = await DB.addSurveyResponse({
     assignment_id: req.params.id, agent_id: req.user.id,
-    answers: notReached ? [] : answers.map((x: any) => ({ question_id: x.question_id, answer_value: x.answer_value, answered: !!x.answered })),
+    answers: (notReached || declined) ? [] : answers.map((x: any) => ({ question_id: x.question_id, answer_value: x.answer_value, answered: !!x.answered })),
     brand_id: a.brand_id, customer_phone: a.customer_phone,
     reachability: notReached ? "not_reached" : "reached",
     action_type: action_type === "complaint" ? "complaint" : "no_action",
     segment: segment || undefined,
+    outcome: declined ? outcome : "completed",
   });
   res.json(updated);
 }));
 
 // View All Surveys — every assignment across campaigns, with filters (for reporting + supervision)
 app.get("/api/surveys/all", authenticateJWT, asyncHandler(async (req: any, res) => {
-  const { brand_id, agent_id, status, action_type, from, to } = req.query;
+  const { brand_id, agent_id, status, action_type, survey_type, segment, from, to } = req.query;
   res.json(await DB.getAllSurveyAssignments({
     brand_id: brand_id as string || undefined,
     agent_id: agent_id as string || undefined,
     status: status as string || undefined,
     action_type: action_type as string || undefined,
+    survey_type: survey_type as string || undefined,
+    segment: segment as string || undefined,
+    from: from as string || undefined,
+    to: to as string || undefined,
+  }));
+}));
+
+// Survey overview: headline counts, per-survey breakdown and per-agent stats.
+// Takes the same filters as /api/surveys/all so the numbers always match the list.
+app.get("/api/surveys/overview", authenticateJWT, asyncHandler(async (req: any, res) => {
+  const { brand_id, agent_id, status, action_type, survey_type, segment, from, to } = req.query;
+  res.json(await DB.getSurveyOverview({
+    brand_id: brand_id as string || undefined,
+    agent_id: agent_id as string || undefined,
+    status: status as string || undefined,
+    action_type: action_type as string || undefined,
+    survey_type: survey_type as string || undefined,
+    segment: segment as string || undefined,
     from: from as string || undefined,
     to: to as string || undefined,
   }));
@@ -2414,6 +2571,23 @@ app.post("/api/surveys/assignments/:id/assign", authenticateJWT, asyncHandler(as
   if (!a) return res.status(404).json({ error: "Assignment not found." });
   const { agent_id } = req.body;
   res.json(await DB.assignSurveyAssignment(req.params.id, agent_id || null));
+}));
+
+// Team-leader edit of a survey's outcome: change status/action, or send a
+// finished survey back to Pending for rework.
+app.patch("/api/surveys/assignments/:id", authenticateJWT, asyncHandler(async (req: any, res) => {
+  if (!isLeaderLevel(req.user.role)) return res.status(403).json({ error: "Access denied." });
+  const a = await DB.getSurveyAssignmentById(req.params.id);
+  if (!a) return res.status(404).json({ error: "Assignment not found." });
+  const { status, action_type, reachability } = req.body;
+  const validStatus = ["pending", "in_progress", "successful", "unreachable", "declined", "refused", "not_interested"];
+  if (status !== undefined && !validStatus.includes(status))
+    return res.status(400).json({ error: "Invalid status." });
+  if (action_type !== undefined && !["no_action", "complaint"].includes(action_type))
+    return res.status(400).json({ error: "Invalid action." });
+  if (reachability !== undefined && !["reached", "not_reached"].includes(reachability))
+    return res.status(400).json({ error: "Invalid reachability." });
+  res.json(await DB.updateSurveyAssignment(req.params.id, { status, action_type, reachability }));
 }));
 
 // Campaign assignments + manual distribution
@@ -2477,13 +2651,14 @@ app.post("/api/survey-records/:type/upload", authenticateJWT, requireUpload, asy
 }));
 
 app.get("/api/survey-records", authenticateJWT, asyncHandler(async (req: any, res) => {
-  const { type, brand_id, answered, from, to } = req.query;
+  const { type, brand_id, answered, from, to, segment } = req.query;
   res.json(await DB.getSurveyRecords({
     record_type: type || undefined,
     brand_id: brand_id || undefined,
     answered: answered === "true" ? true : answered === "false" ? false : undefined,
     from: from || undefined,
     to: to || undefined,
+    segment: segment || undefined,
   }));
 }));
 

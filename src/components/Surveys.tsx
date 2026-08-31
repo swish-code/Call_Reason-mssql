@@ -14,17 +14,18 @@ type Tab = "campaigns" | "queue" | "all" | "templates" | "data";
 export default function Surveys({ currentUser }: SurveysProps) {
   const role = currentUser.role;
   const isAgent = role === "agent";
+  const isMarketing = role === "marketing";
 
   const tabs: { key: Tab; label: string; icon: ReactNode; visible: boolean }[] = [
-    { key: "campaigns", label: "Campaigns", icon: <Megaphone className="w-4 h-4" />, visible: !isAgent },
-    { key: "queue", label: "Survey Queue", icon: <ListChecks className="w-4 h-4" />, visible: true },
+    { key: "campaigns", label: "Campaigns", icon: <Megaphone className="w-4 h-4" />, visible: !isAgent && !isMarketing },
+    { key: "queue", label: "Survey Queue", icon: <ListChecks className="w-4 h-4" />, visible: !isMarketing },
     { key: "all", label: "All Surveys", icon: <LayoutList className="w-4 h-4" />, visible: !isAgent },
     { key: "templates", label: "Templates", icon: <ClipboardList className="w-4 h-4" />, visible: ["admin", "manager", "supervisor", "leader"].includes(role) },
     { key: "data", label: "Survey Data", icon: <Database className="w-4 h-4" />, visible: !isAgent },
   ];
 
   const visibleTabs = tabs.filter(t => t.visible);
-  const [active, setActive] = useState<Tab>(isAgent ? "queue" : "campaigns");
+  const [active, setActive] = useState<Tab>(isMarketing ? "all" : isAgent ? "queue" : "campaigns");
 
   // Guard: if the current tab is not visible for this role, fall back to the first visible one.
   const activeTab = visibleTabs.some(t => t.key === active) ? active : (visibleTabs[0]?.key || "queue");

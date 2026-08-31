@@ -1,5 +1,5 @@
 // Coarse permission bucket. Authority order is driven by `level` (below), not by role.
-export type UserRole = "agent" | "leader" | "supervisor" | "manager" | "owner" | "admin";
+export type UserRole = "agent" | "leader" | "supervisor" | "manager" | "owner" | "admin" | "marketing";
 
 // Organizational team an employee belongs to (separate from the permission role)
 export type Team = "Complain Team" | "Call Center" | "Technical Team" | "Team Leader";
@@ -46,6 +46,7 @@ export const USER_TYPES: UserType[] = [
   { value: "operations_manager", label: "Operations Manager", role: "manager", department: null, level: LEVEL.MANAGER },
   { value: "owner", label: "Owner", role: "owner", department: null, level: LEVEL.OWNER },
   { value: "system_admin", label: "System Admin", role: "admin", department: null, level: LEVEL.ADMIN },
+  { value: "marketing_viewer", label: "Marketing (View Only)", role: "marketing", department: null, level: LEVEL.AGENT },
 ];
 
 // Default level for a bare role (used to backfill legacy accounts without a stored level)
@@ -282,7 +283,7 @@ export type SurveyType = 'marketing_item' | 'marketing_general' | 'daily_normal'
 export type AssignmentMode = 'assigned' | 'open';
 export type ContinuityType = 'one_time_slot' | 'continuous';
 export type CampaignStatus = 'pending' | 'active' | 'full_today' | 'completed' | 'cancelled';
-export type SurveyAssignmentStatus = 'pending' | 'in_progress' | 'successful' | 'no_answer' | 'unreachable' | 'declined';
+export type SurveyAssignmentStatus = 'pending' | 'in_progress' | 'successful' | 'no_answer' | 'unreachable' | 'declined' | 'refused' | 'not_interested';
 
 // Customer segments — a question can target one segment, or be shared (empty = All)
 export const SURVEY_SEGMENTS = ["Loyal", "Occasional", "Low-Frequency", "High-Value Churned"] as const;
@@ -308,6 +309,9 @@ export interface SurveyTemplate {
   question_count?: number;
   questions?: SurveyQuestion[];
   created_at: string;
+  /** True once any of this template's questions has a recorded answer — the
+   * template is then frozen and cannot be edited (see server/db.ts). */
+  has_data?: boolean;
 }
 
 export interface SurveyCampaign {

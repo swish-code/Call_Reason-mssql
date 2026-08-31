@@ -1052,7 +1052,12 @@ export class DB {
   static async getSurveyTemplates(): Promise<any[]> {
     const { rows } = await pool.query(`
       SELECT t.*, b.brand_name, u.full_name AS created_by_name,
-        (SELECT COUNT(*) FROM survey_questions q WHERE q.template_id = t.id) AS question_count
+        (SELECT COUNT(*) FROM survey_questions q WHERE q.template_id = t.id) AS question_count,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM survey_answers a
+          JOIN survey_questions q ON q.id = a.question_id
+          WHERE q.template_id = t.id
+        ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS has_data
       FROM survey_templates t
       LEFT JOIN brands b ON b.id = t.brand_id
       LEFT JOIN users u ON u.id = t.created_by
@@ -1063,7 +1068,12 @@ export class DB {
 
   static async getSurveyTemplateById(id: string): Promise<any | undefined> {
     const { rows } = await pool.query(`
-      SELECT TOP (1) t.*, b.brand_name, u.full_name AS created_by_name
+      SELECT TOP (1) t.*, b.brand_name, u.full_name AS created_by_name,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM survey_answers a
+          JOIN survey_questions q ON q.id = a.question_id
+          WHERE q.template_id = t.id
+        ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS has_data
       FROM survey_templates t
       LEFT JOIN brands b ON b.id = t.brand_id
       LEFT JOIN users u ON u.id = t.created_by
@@ -1072,6 +1082,55 @@ export class DB {
     if (!rows[0]) return undefined;
     const q = await pool.query("SELECT * FROM survey_questions WHERE template_id = $1 ORDER BY q_order ASC", [id]);
     return { ...rows[0], questions: q.rows };
+  }
+
+  /**
+   * True once any of a template's questions have a recorded answer. Used to
+   * lock editing entirely — a fresh template can be edited freely, but once
+   * real survey results exist under it, it is frozen and a new template is
+   * made instead (see updateSurveyTemplate).
+   */
+  static async templateHasRecordedData(templateId: string): Promise<boolean> {
+    const { rows } = await pool.query(
+      `SELECT CASE WHEN EXISTS (
+         SELECT 1 FROM survey_answers a
+         JOIN survey_questions q ON q.id = a.question_id
+         WHERE q.template_id = $1
+       ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS has_data`,
+      [templateId]
+    );
+    return !!rows[0]?.has_data;
+  }
+
+  /**
+   * Every completed answer for a template's questions, one flat row per
+   * (response, question) — the shape the frontend pivots into one row per
+   * respondent / one column per question for the export.
+   */
+  static async getTemplateExportRows(templateId: string): Promise<{
+    template: any; questions: any[];
+    answers: { response_id: string; customer_phone: string; agent_name: string | null;
+      answered_at: string; brand_name: string | null; segment: string | null;
+      question_id: string; answer_value: string | null }[];
+  }> {
+    const template = await DB.getSurveyTemplateById(templateId);
+    if (!template) throw new Error("Template not found.");
+
+    const { rows: answers } = await pool.query(`
+      SELECT r.id AS response_id, asg.customer_phone, u.full_name AS agent_name,
+        r.answered_at, b.brand_name, asg.segment,
+        a.question_id, a.answer_value
+      FROM survey_answers a
+      JOIN survey_questions q ON q.id = a.question_id
+      JOIN survey_responses r ON r.id = a.response_id
+      JOIN survey_assignments asg ON asg.id = r.assignment_id
+      LEFT JOIN users u ON u.id = r.agent_id
+      LEFT JOIN brands b ON b.id = asg.brand_id
+      WHERE q.template_id = $1
+      ORDER BY r.answered_at ASC
+    `, [templateId]);
+
+    return { template, questions: template.questions, answers };
   }
 
   static async createSurveyTemplate(data: {
@@ -1106,8 +1165,14 @@ export class DB {
 
   static async updateSurveyTemplate(id: string, data: {
     name?: string; brand_id?: string | null; active?: boolean;
-    questions?: { text: string; answer_type: string; options?: any; q_order?: number; segment?: string | null }[];
+    questions?: { id?: string; text: string; answer_type: string; options?: any; q_order?: number; segment?: string | null }[];
   }): Promise<any | undefined> {
+    // A template with recorded answers is frozen entirely — not just its
+    // questions. No edit path can ever touch a template real survey results
+    // already exist under. Create a new template instead.
+    if (await DB.templateHasRecordedData(id)) {
+      throw new Error("This template already has recorded survey answers and can no longer be edited. Create a new template instead.");
+    }
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -1117,14 +1182,43 @@ export class DB {
       if (data.active !== undefined) { sets.push(`active = $${idx++}`); vals.push(data.active); }
       if (sets.length) { vals.push(id); await client.query(`UPDATE survey_templates SET ${sets.join(",")} WHERE id = $${idx}`, vals); }
       if (data.questions) {
-        await client.query("DELETE FROM survey_questions WHERE template_id = $1", [id]);
+        // Upsert by id instead of delete-all-then-reinsert: recreating every
+        // question on every edit gave each one a fresh id, which would sever
+        // the FK on any already-recorded survey_answers row (ON DELETE SET
+        // NULL). Existing rows are updated in place (same id, so past
+        // answers stay linked); only questions the caller genuinely removed
+        // are deleted, and only new ones (no id, or an id that isn't a real
+        // existing question here) are inserted. The freeze guard above means
+        // this path only ever runs on a template with zero recorded answers,
+        // but the upsert stays as a second layer of protection.
+        const { rows: existing } = await client.query(
+          "SELECT id FROM survey_questions WHERE template_id = $1", [id]
+        );
+        const existingIds = new Set(existing.map((r: any) => r.id));
+        const keptIds = new Set<string>();
+
         for (let i = 0; i < data.questions.length; i++) {
           const q = data.questions[i];
-          const qid = "sq-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
-          await client.query(
-            "INSERT INTO survey_questions (id,template_id,text,answer_type,options,q_order,segment) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            [qid, id, q.text, q.answer_type || "free_text", q.options ? JSON.stringify(q.options) : null, q.q_order ?? i, q.segment || null]
-          );
+          const optionsJson = q.options ? JSON.stringify(q.options) : null;
+          if (q.id && existingIds.has(q.id)) {
+            await client.query(
+              `UPDATE survey_questions SET text=$1, answer_type=$2, options=$3, q_order=$4, segment=$5 WHERE id=$6`,
+              [q.text, q.answer_type || "free_text", optionsJson, q.q_order ?? i, q.segment || null, q.id]
+            );
+            keptIds.add(q.id);
+          } else {
+            const qid = "sq-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 999);
+            await client.query(
+              "INSERT INTO survey_questions (id,template_id,text,answer_type,options,q_order,segment) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+              [qid, id, q.text, q.answer_type || "free_text", optionsJson, q.q_order ?? i, q.segment || null]
+            );
+            keptIds.add(qid);
+          }
+        }
+
+        const removedIds = [...existingIds].filter((eid) => !keptIds.has(eid));
+        if (removedIds.length) {
+          await client.query("DELETE FROM survey_questions WHERE id = ANY($1)", [removedIds]);
         }
       }
       await client.query("COMMIT");
@@ -1271,6 +1365,18 @@ export class DB {
   // ----------------------------------------------------
   // Surveys — Queue / assignments / attempts / responses
   // ----------------------------------------------------
+  /**
+   * An agent's work queue for today.
+   *
+   * Scoping rule: once a supervisor has hand-assigned any number to this agent,
+   * their queue shows ONLY their own assignments — the shared unassigned pool of
+   * an 'open' campaign is hidden, so a targeted assignment is not drowned out by
+   * the rest of the campaign. Agents with nothing assigned still draw from the
+   * shared pool, which is what keeps 'open' campaigns self-serve.
+   *
+   * The check is per-campaign, not global: being assigned rows in campaign A
+   * must not hide campaign B's open pool from them.
+   */
   static async getSurveyQueue(userId: string): Promise<any[]> {
     const { rows } = await pool.query(`
       SELECT TOP (300) a.*, c.template_id, c.survey_type, c.assignment_mode, c.continuity_type, b.brand_name,
@@ -1280,9 +1386,19 @@ export class DB {
       LEFT JOIN brands b ON b.id = a.brand_id
       LEFT JOIN survey_templates t ON t.id = c.template_id
       WHERE a.status = 'pending' AND a.scheduled_date <= CAST(SYSDATETIMEOFFSET() AS DATE) AND c.status = 'active'
-        AND ( a.assigned_agent_id = $1 OR (c.assignment_mode = 'open' AND a.assigned_agent_id IS NULL) )
+        AND (
+          a.assigned_agent_id = $1
+          OR (
+            c.assignment_mode = 'open' AND a.assigned_agent_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM survey_assignments mine
+              WHERE mine.campaign_id = a.campaign_id
+                AND mine.assigned_agent_id = $1
+                AND mine.status = 'pending'
+            )
+          )
+        )
       ORDER BY a.scheduled_date ASC, a.created_at ASC
-
     `, [userId]);
     return rows;
   }
@@ -1368,10 +1484,17 @@ export class DB {
     answers: { question_id: string; answer_value?: string; answered: boolean }[];
     brand_id: string | null; customer_phone: string;
     reachability?: string; action_type?: string; segment?: string;
+    // "completed" (default) collects the answers below; "refused"/"not_interested"
+    // record that the agent reached the customer but they declined the survey —
+    // no answers are stored for those, but they are NOT bucketed with unreachable.
+    outcome?: "completed" | "refused" | "not_interested";
   }): Promise<any> {
     const reachability = data.reachability === "not_reached" ? "not_reached" : "reached";
     const action_type = data.action_type === "complaint" ? "complaint" : "no_action";
-    const answered = reachability === "reached";
+    const declinedOutcome = reachability === "reached" && (data.outcome === "refused" || data.outcome === "not_interested");
+    // "answered" drives whether real answers are stored/counted as a completed
+    // survey; a reached-but-declined outcome collected no answers either.
+    const answered = reachability === "reached" && !declinedOutcome;
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -1407,8 +1530,9 @@ export class DB {
           }
         }
       }
-      // Terminal status: successful when reached, unreachable when not
-      const newStatus = answered ? "successful" : "unreachable";
+      // Terminal status: successful when a real survey was collected, the
+      // declined outcome when reached-but-refused, unreachable otherwise.
+      const newStatus = answered ? "successful" : declinedOutcome ? (data.outcome as string) : "unreachable";
       await client.query(
         "UPDATE survey_assignments SET status = $2, reachability = $3, action_type = $4, completed_at = SYSDATETIMEOFFSET() WHERE id = $1",
         [data.assignment_id, newStatus, reachability, action_type]
@@ -1421,7 +1545,7 @@ export class DB {
         `INSERT INTO survey_records (id,record_type,brand_id,brand_label,phone,served_by,rate,answered,comment,complaint,note,segment,extra,record_date,uploaded_by,created_at)
          VALUES ($1,'survey_live',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, CONVERT(varchar(10), DATEADD(hour, 3, SYSDATETIMEOFFSET()), 23), $13, SYSDATETIMEOFFSET())`,
         [srid, data.brand_id, asg?.brand_name || null, data.customer_phone, agentName, rate, answered,
-         comment, complaint, action_type, data.segment || null, JSON.stringify({ reachability, action_type, segment: data.segment || null, campaign_id: asg?.campaign_id, template: asg?.template_name }), data.agent_id]
+         comment, complaint, action_type, data.segment || null, JSON.stringify({ reachability, action_type, outcome: newStatus, segment: data.segment || null, campaign_id: asg?.campaign_id, template: asg?.template_name }), data.agent_id]
       );
       // Update contact recency
       const ccid = "cc-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
@@ -1455,23 +1579,12 @@ export class DB {
 
   // All survey assignments across campaigns, for the "View All Surveys" page + reporting
   static async getAllSurveyAssignments(filter: {
-    brand_id?: string; agent_id?: string; status?: string; action_type?: string; from?: string; to?: string;
+    brand_id?: string; agent_id?: string; status?: string; action_type?: string; survey_type?: string; segment?: string; from?: string; to?: string;
   } = {}): Promise<{ records: any[]; total: number; cap: number }> {
-    const clauses: string[] = []; const values: any[] = []; let idx = 1;
-    if (filter.brand_id) { clauses.push(`a.brand_id = $${idx++}`); values.push(filter.brand_id); }
-    if (filter.agent_id === "unassigned") { clauses.push(`a.assigned_agent_id IS NULL`); }
-    else if (filter.agent_id) { clauses.push(`a.assigned_agent_id = $${idx++}`); values.push(filter.agent_id); }
-    // Status buckets: pending (pending+in_progress), completed (successful), not_reached (unreachable+declined)
-    if (filter.status === "pending") { clauses.push(`a.status IN ('pending','in_progress')`); }
-    else if (filter.status === "completed") { clauses.push(`a.status = 'successful'`); }
-    else if (filter.status === "not_reached") { clauses.push(`a.status IN ('unreachable','declined')`); }
-    if (filter.action_type) { clauses.push(`a.action_type = $${idx++}`); values.push(filter.action_type); }
-    if (filter.from) { clauses.push(`a.created_at >= $${idx++}`); values.push(filter.from); }
-    if (filter.to) { clauses.push(`a.created_at <= $${idx++}`); values.push(filter.to); }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const { where, values } = DB.surveyFilterSql(filter);
     const CAP = 1000;
     const { rows } = await pool.query(`
-      SELECT TOP (${CAP}) a.*, b.brand_name, u.full_name AS agent_name, c.assignment_mode, t.name AS template_name
+      SELECT TOP (${CAP}) a.*, b.brand_name, u.full_name AS agent_name, c.assignment_mode, c.survey_type, t.name AS template_name
       FROM survey_assignments a
       LEFT JOIN brands b ON b.id = a.brand_id
       LEFT JOIN users u ON u.id = a.assigned_agent_id
@@ -1482,6 +1595,141 @@ export class DB {
     `, values);
     const { rows: cnt } = await pool.query(`SELECT COUNT(*) AS total FROM survey_assignments a ${where}`, values);
     return { records: rows, total: cnt[0]?.total ?? rows.length, cap: CAP };
+  }
+
+  /**
+   * Shared WHERE builder for the All-Surveys views, so the list, the overview
+   * counts and the per-agent stats can never disagree about what "the current
+   * filter" means.
+   */
+  private static surveyFilterSql(filter: {
+    brand_id?: string; agent_id?: string; status?: string; action_type?: string;
+    survey_type?: string; segment?: string; from?: string; to?: string;
+  }, startIdx = 1): { where: string; values: any[]; nextIdx: number } {
+    const clauses: string[] = []; const values: any[] = []; let idx = startIdx;
+    if (filter.brand_id) { clauses.push(`a.brand_id = $${idx++}`); values.push(filter.brand_id); }
+    // survey_type lives on the campaign, so this is a correlated lookup rather
+    // than a column on the assignment itself.
+    if (filter.survey_type) {
+      clauses.push(`EXISTS (SELECT 1 FROM survey_campaigns sc WHERE sc.id = a.campaign_id AND sc.survey_type = $${idx++})`);
+      values.push(filter.survey_type);
+    }
+    // "none" selects rows uploaded without a segment, which is a real bucket
+    // worth isolating — not the same as "no segment filter applied".
+    if (filter.segment === "none") { clauses.push(`(a.segment IS NULL OR TRIM(a.segment) = '')`); }
+    else if (filter.segment) { clauses.push(`a.segment = $${idx++}`); values.push(filter.segment); }
+    if (filter.agent_id === "unassigned") { clauses.push(`a.assigned_agent_id IS NULL`); }
+    else if (filter.agent_id) { clauses.push(`a.assigned_agent_id = $${idx++}`); values.push(filter.agent_id); }
+    if (filter.status === "pending") { clauses.push(`a.status IN ('pending','in_progress')`); }
+    else if (filter.status === "completed") { clauses.push(`a.status = 'successful'`); }
+    else if (filter.status === "not_reached") { clauses.push(`a.status IN ('unreachable','declined')`); }
+    // Reached, but the customer declined to finish or wasn't interested — distinct
+    // from "not_reached" (never got the customer on the line at all).
+    else if (filter.status === "refused") { clauses.push(`a.status = 'refused'`); }
+    else if (filter.status === "not_interested") { clauses.push(`a.status = 'not_interested'`); }
+    if (filter.action_type) { clauses.push(`a.action_type = $${idx++}`); values.push(filter.action_type); }
+    if (filter.from) { clauses.push(`a.created_at >= $${idx++}`); values.push(filter.from); }
+    if (filter.to) { clauses.push(`a.created_at <= $${idx++}`); values.push(filter.to); }
+    return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", values, nextIdx: idx };
+  }
+
+  /**
+   * Headline counts, a per-survey (template) breakdown and per-agent stats for
+   * the All Surveys page. Status buckets match the list view exactly:
+   *   successful                  -> Completed – Reached
+   *   unreachable / declined      -> Completed – Not Reached
+   *   refused / not_interested    -> Reached, but declined to finish (own bucket —
+   *                                  neither "collected a survey" nor "never got them")
+   *   pending / in_progress       -> Pending
+   *
+   * SQL Server has no FILTER (WHERE ...) clause (Postgres-only), so each
+   * bucket is a SUM(CASE WHEN ... THEN 1 ELSE 0 END) instead.
+   */
+  static async getSurveyOverview(filter: {
+    brand_id?: string; agent_id?: string; status?: string; action_type?: string; survey_type?: string; segment?: string; from?: string; to?: string;
+  } = {}): Promise<{
+    summary: { total: number; reached: number; not_reached: number; refused_not_interested: number; pending: number };
+    byTemplate: { template_name: string; total: number; reached: number; not_reached: number; refused_not_interested: number; pending: number }[];
+    byAgent: { agent_id: string | null; agent_name: string; assigned: number; completed: number; reached: number; not_reached: number; refused_not_interested: number; pending: number }[];
+  }> {
+    const { where, values } = DB.surveyFilterSql(filter);
+    const BUCKETS = `
+      COUNT(*) AS total,
+      SUM(CASE WHEN a.status = 'successful' THEN 1 ELSE 0 END) AS reached,
+      SUM(CASE WHEN a.status IN ('unreachable','declined') THEN 1 ELSE 0 END) AS not_reached,
+      SUM(CASE WHEN a.status IN ('refused','not_interested') THEN 1 ELSE 0 END) AS refused_not_interested,
+      SUM(CASE WHEN a.status IN ('pending','in_progress') THEN 1 ELSE 0 END) AS pending`;
+
+    const { rows: sum } = await pool.query(`
+      SELECT ${BUCKETS} FROM survey_assignments a ${where}
+    `, values);
+
+    const { rows: byTemplate } = await pool.query(`
+      SELECT COALESCE(t.name, N'— No template —') AS template_name, ${BUCKETS}
+      FROM survey_assignments a
+      LEFT JOIN survey_campaigns c ON c.id = a.campaign_id
+      LEFT JOIN survey_templates t ON t.id = c.template_id
+      ${where}
+      GROUP BY COALESCE(t.name, N'— No template —')
+      ORDER BY total DESC
+    `, values);
+
+    const { rows: byAgent } = await pool.query(`
+      SELECT a.assigned_agent_id AS agent_id,
+             COALESCE(u.full_name, N'— Unassigned —') AS agent_name,
+             ${BUCKETS},
+             SUM(CASE WHEN a.status IN ('successful','unreachable','declined','refused','not_interested') THEN 1 ELSE 0 END) AS completed
+      FROM survey_assignments a
+      LEFT JOIN users u ON u.id = a.assigned_agent_id
+      ${where}
+      GROUP BY a.assigned_agent_id, u.full_name
+      ORDER BY total DESC
+    `, values);
+
+    const s = sum[0] || {};
+    return {
+      summary: {
+        total: s.total ?? 0, reached: s.reached ?? 0,
+        not_reached: s.not_reached ?? 0, refused_not_interested: s.refused_not_interested ?? 0,
+        pending: s.pending ?? 0,
+      },
+      // `assigned` is the agent's whole workload; `completed` is everything that
+      // reached a terminal state, whatever the outcome.
+      byTemplate,
+      byAgent: byAgent.map((r: any) => ({ ...r, assigned: r.total })),
+    };
+  }
+
+  /**
+   * Leader-level edit of a single survey's outcome.
+   *
+   * Returning a finished survey to Pending also clears the outcome fields and
+   * resets attempt_count — otherwise the row would reappear in the queue but
+   * the agent could not act on it, since three logged attempts block any
+   * further call.
+   */
+  static async updateSurveyAssignment(id: string, fields: {
+    status?: string; action_type?: string; reachability?: string;
+  }): Promise<any | undefined> {
+    const sets: string[] = []; const values: any[] = []; let idx = 1;
+
+    if (fields.status === "pending") {
+      sets.push(`status = 'pending'`, `reachability = NULL`, `completed_at = NULL`, `attempt_count = 0`);
+    } else if (fields.status) {
+      sets.push(`status = $${idx++}`); values.push(fields.status);
+      // A terminal status carries its matching reachability and a completion stamp.
+      // refused/not_interested are reached-but-declined outcomes, not "never got them".
+      if (fields.status === "successful" || fields.status === "refused" || fields.status === "not_interested") sets.push(`reachability = 'reached'`);
+      else if (fields.status === "unreachable" || fields.status === "declined") sets.push(`reachability = 'not_reached'`);
+      sets.push(`completed_at = COALESCE(completed_at, SYSDATETIMEOFFSET())`);
+    }
+    if (fields.action_type) { sets.push(`action_type = $${idx++}`); values.push(fields.action_type); }
+    if (fields.reachability) { sets.push(`reachability = $${idx++}`); values.push(fields.reachability); }
+    if (!sets.length) return DB.getSurveyAssignmentById(id);
+
+    values.push(id);
+    await pool.query(`UPDATE survey_assignments SET ${sets.join(", ")} WHERE id = $${idx}`, values);
+    return DB.getSurveyAssignmentById(id);
   }
 
   static async getCampaignAssignments(campaignId: string): Promise<any[]> {
@@ -1511,6 +1759,26 @@ export class DB {
       SELECT id, full_name, role, work_type FROM users
       WHERE status = 'Active' AND (work_type IS NULL OR work_type IN ('survey','both'))
       ORDER BY full_name ASC
+    `);
+    return rows;
+  }
+
+  /**
+   * Survey-capable agents with their current workload, so whoever is assigning
+   * can see how loaded each agent already is instead of guessing.
+   * `open_tasks` is what still needs doing; `total_tasks` is everything ever
+   * assigned to them.
+   */
+  static async getSurveyAgentWorkload(): Promise<any[]> {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.full_name, u.role, u.work_type,
+        SUM(CASE WHEN a.status IN ('pending','in_progress') THEN 1 ELSE 0 END) AS open_tasks,
+        COUNT(a.id) AS total_tasks
+      FROM users u
+      LEFT JOIN survey_assignments a ON a.assigned_agent_id = u.id
+      WHERE u.status = 'Active' AND (u.work_type IS NULL OR u.work_type IN ('survey','both'))
+      GROUP BY u.id, u.full_name, u.role, u.work_type
+      ORDER BY u.full_name ASC
     `);
     return rows;
   }
@@ -1554,7 +1822,7 @@ export class DB {
   }
 
   static async getSurveyRecords(filter: {
-    record_type?: string; brand_id?: string; answered?: boolean; from?: string; to?: string;
+    record_type?: string; brand_id?: string; answered?: boolean; from?: string; to?: string; segment?: string;
   } = {}): Promise<{ records: any[]; total: number; cap: number }> {
     const clauses: string[] = []; const values: any[] = []; let idx = 1;
     if (filter.record_type) { clauses.push(`r.record_type = $${idx++}`); values.push(filter.record_type); }
@@ -1562,6 +1830,8 @@ export class DB {
     if (filter.answered != null) { clauses.push(`r.answered = $${idx++}`); values.push(filter.answered); }
     if (filter.from) { clauses.push(`r.created_at >= $${idx++}`); values.push(filter.from); }
     if (filter.to) { clauses.push(`r.created_at <= $${idx++}`); values.push(filter.to); }
+    if (filter.segment === "none") { clauses.push(`r.segment IS NULL`); }
+    else if (filter.segment) { clauses.push(`r.segment = $${idx++}`); values.push(filter.segment); }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const LIST_CAP = 1000;
     const { rows } = await pool.query(`
@@ -1578,30 +1848,49 @@ export class DB {
   }
 
   // Delete survey records (optionally scoped by the same filters as the list).
+  /**
+   * `survey_live` rows are written automatically when an agent completes (or
+   * marks Not Reached on) a live survey — they are the employee's own
+   * recorded work, not an admin-uploaded file. This function must never be
+   * able to delete them, regardless of what filter is passed in, so the
+   * guard sits inside the query itself rather than relying on every caller
+   * remembering to exclude it.
+   */
   static async deleteSurveyRecords(filter: {
     record_type?: string; brand_id?: string; answered?: boolean; from?: string; to?: string;
   } = {}): Promise<number> {
-    const clauses: string[] = []; const values: any[] = []; let idx = 1;
+    if (filter.record_type === "survey_live") {
+      throw new Error("Survey responses recorded by agents cannot be deleted.");
+    }
+    const clauses: string[] = ["record_type <> 'survey_live'"]; const values: any[] = []; let idx = 1;
     if (filter.record_type) { clauses.push(`record_type = $${idx++}`); values.push(filter.record_type); }
     if (filter.brand_id) { clauses.push(`brand_id = $${idx++}`); values.push(filter.brand_id); }
     if (filter.answered != null) { clauses.push(`answered = $${idx++}`); values.push(filter.answered); }
     if (filter.from) { clauses.push(`created_at >= $${idx++}`); values.push(filter.from); }
     if (filter.to) { clauses.push(`created_at <= $${idx++}`); values.push(filter.to); }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const where = `WHERE ${clauses.join(" AND ")}`;
     const res = await pool.query(`DELETE FROM survey_records ${where}`, values);
     return res.rowCount ?? 0;
   }
 
   // Remove duplicate survey records — keeps the earliest row per
   // (record_type, order_id); only dedupes rows that carry an order_id.
+  // Excludes survey_live for the same reason as deleteSurveyRecords above.
+  //
+  // NOTE: the original port of this query used Postgres' `DELETE ... USING`,
+  // which SQL Server does not support at all (no such clause exists there) —
+  // fixed here to the T-SQL form (`DELETE <alias> FROM ... JOIN ...`).
   static async dedupeSurveyRecords(): Promise<number> {
     const res = await pool.query(`
-      DELETE FROM survey_records a USING survey_records b
-      WHERE a.id > b.id
-        AND a.record_type = b.record_type
-        AND a.order_id IS NOT NULL AND a.order_id <> ''
+      DELETE a
+      FROM survey_records a
+      JOIN survey_records b
+        ON a.record_type = b.record_type
         AND a.order_id = b.order_id
         AND COALESCE(a.phone,'') = COALESCE(b.phone,'')
+      WHERE a.id > b.id
+        AND a.record_type <> 'survey_live'
+        AND a.order_id IS NOT NULL AND a.order_id <> ''
     `);
     return res.rowCount ?? 0;
   }
@@ -1629,6 +1918,19 @@ export class DB {
     // Avg rating per platform / per brand (spec §6)
     const platformPerf = (await q(`SELECT COALESCE(p.name,'—') name, COUNT(*) count, COALESCE(ROUND(AVG(CAST(rating AS FLOAT)),2),0) avg FROM ratings r LEFT JOIN platforms p ON p.id=r.platform_id WHERE ${rW} GROUP BY p.name ORDER BY count DESC `)).rows;
     const brandPerf = (await q(`SELECT COALESCE(b.brand_name,'—') name, COUNT(*) count, COALESCE(ROUND(AVG(CAST(rating AS FLOAT)),2),0) avg FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id WHERE ${rW} GROUP BY b.brand_name ORDER BY count DESC `)).rows;
+    // Per-branch detail behind each brand, so a brand row can be expanded to see
+    // which branches are pulling its average up or down. Rows with no branch on
+    // the source review are grouped under a single explicit bucket rather than
+    // silently dropped, so the branch counts still reconcile with the brand total.
+    const brandBranchPerf = (await q(`
+      SELECT COALESCE(b.brand_name,'—') brand,
+             COALESCE(NULLIF(TRIM(r.branch),''),'— No branch —') name,
+             COUNT(*) count,
+             COALESCE(ROUND(AVG(CAST(rating AS FLOAT)),2),0) avg
+      FROM ratings r LEFT JOIN brands b ON b.id=r.brand_id
+      WHERE ${rW}
+      GROUP BY b.brand_name, COALESCE(NULLIF(TRIM(r.branch),''),'— No branch —')
+      ORDER BY brand ASC, count DESC`)).rows;
     const rByAgent = (await q(`SELECT TOP (10) ua.full_name name, COUNT(*) assigned,
         SUM(CASE WHEN r.action_status IN ('resolved','no_action_needed','unreachable') THEN 1 ELSE 0 END) done
       FROM ratings r JOIN users ua ON ua.id=r.assigned_agent_id WHERE ${rW} AND r.assigned_agent_id IS NOT NULL
@@ -1668,7 +1970,7 @@ export class DB {
         resolved: rTot.resolved, unreachable: rTot.unreachable,
         resolutionRate: rTot.needs_action > 0 ? Math.round((rTot.resolved / rTot.needs_action) * 100) : 0,
         byStatus: rByStatus, byRating: rByRating, byBrand: rByBrand, byPlatform: rByPlatform, byAgent: rByAgent,
-        platformPerf, brandPerf,
+        platformPerf, brandPerf, brandBranchPerf,
       },
       surveys: {
         campaigns: { total: campTotal, byStatus: campByStatus },

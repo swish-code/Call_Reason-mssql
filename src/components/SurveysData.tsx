@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { User, SurveyRecord, SurveyRecordType, Brand } from "../types.js";
+import { User, SurveyRecord, SurveyRecordType, Brand, SURVEY_SEGMENTS } from "../types.js";
 import { apiFetch } from "../lib/api.ts";
 import { Database, RefreshCw, AlertCircle, Copy, Trash2, Download } from "lucide-react";
 import SurveyDataUploadButton from "./SurveyDataUploadButton.tsx";
@@ -45,6 +45,7 @@ export default function SurveysData({ currentUser }: SurveysDataProps) {
   const [type, setType] = useState("");
   const [brandId, setBrandId] = useState("");
   const [answered, setAnswered] = useState(""); // "", "answered", "no_answer"
+  const [segment, setSegment] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
 
@@ -60,10 +61,11 @@ export default function SurveysData({ currentUser }: SurveysDataProps) {
     if (brandId) p.set('brand_id', brandId);
     if (answered === 'answered') p.set('answered', 'true');
     else if (answered === 'no_answer') p.set('answered', 'false');
+    if (segment) p.set('segment', segment);
     if (from) p.set('from', from);
     if (to) p.set('to', to);
     return p.toString();
-  }, [type, brandId, answered, from, to]);
+  }, [type, brandId, answered, segment, from, to]);
 
   const fetchRecords = useCallback(async () => {
     setLoading(true);
@@ -96,12 +98,10 @@ export default function SurveysData({ currentUser }: SurveysDataProps) {
     if (res.ok) { const d = await res.json(); fetchRecords(); alert(`${d.removed} duplicate record(s) removed.`); }
     else { const d = await res.json().catch(() => ({})); setError(d.error || "Failed."); }
   };
-  const anyFilter = !!(type || brandId || answered || from || to);
   const deleteData = async () => {
-    const msg = anyFilter
-      ? "Delete the FILTERED survey records? This cannot be undone."
-      : "Delete ALL survey data? This cannot be undone.";
-    if (!window.confirm(msg)) return;
+    // The button only renders once a specific (non-live) Type filter is
+    // picked, so this always deletes a bounded, filtered set — never "all".
+    if (!window.confirm("Delete the filtered survey records? This cannot be undone.")) return;
     const res = await apiFetch('/api/survey-records/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -183,7 +183,12 @@ export default function SurveysData({ currentUser }: SurveysDataProps) {
           >
             <Download className="w-4 h-4" /> Export CSV
           </button>
-          {isAdmin && (
+          {/* Survey (Live) rows are recorded automatically when an agent completes
+              a survey — that is the employee's own work, never deletable. The
+              delete/dedupe tools only appear once a specific OTHER type is
+              picked, so there is no filter combination (including "no filter
+              at all") that can reach live records through this UI. */}
+          {isAdmin && type && type !== 'survey_live' && (
             <button
               onClick={dedupe}
               title="Remove duplicate records"
@@ -192,13 +197,13 @@ export default function SurveysData({ currentUser }: SurveysDataProps) {
               <Copy className="w-4 h-4" /> Remove duplicates
             </button>
           )}
-          {isAdmin && (
+          {isAdmin && type && type !== 'survey_live' && (
             <button
               onClick={deleteData}
-              title={anyFilter ? "Delete filtered records" : "Delete all survey data"}
+              title="Delete filtered records"
               className="px-4 py-2.5 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 font-bold rounded-2xl text-xs flex items-center gap-1.5 transition active:scale-95"
             >
-              <Trash2 className="w-4 h-4" /> {anyFilter ? "Delete filtered" : "Delete all"}
+              <Trash2 className="w-4 h-4" /> Delete filtered
             </button>
           )}
           <SurveyDataUploadButton currentUser={currentUser} onUploaded={fetchRecords} />
@@ -219,6 +224,11 @@ export default function SurveysData({ currentUser }: SurveysDataProps) {
           <option value="">All</option>
           <option value="answered">Answered</option>
           <option value="no_answer">No Answer</option>
+        </select>
+        <select value={segment} onChange={e => setSegment(e.target.value)} className={selCls} title="Customer segment">
+          <option value="">All Segments</option>
+          {SURVEY_SEGMENTS.map(s => <option key={s} value={s}>{s}</option>)}
+          <option value="none">— No segment —</option>
         </select>
         <input type="date" value={from} onChange={e => setFrom(e.target.value)} className={inputCls} title="From" />
         <input type="date" value={to} onChange={e => setTo(e.target.value)} className={inputCls} title="To" />

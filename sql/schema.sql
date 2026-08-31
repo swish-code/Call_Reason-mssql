@@ -548,4 +548,20 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'uq_assigned_tasks_templat
     WHERE template_id IS NOT NULL;
 GO
 
+-- ==================================================================
+-- Post-initial-release column additions
+-- ==================================================================
+-- Unlike the block above (only ever runs against a brand-new database), the
+-- checks below use IF NOT EXISTS on sys.columns so this script stays safe to
+-- re-run against a database that was already created from an earlier version
+-- of this file — re-running it picks up anything added since, without
+-- touching what's already there.
+
+-- Human-facing task number for tracking/referencing a survey. IDENTITY
+-- backfills every existing row (in an unspecified but fixed order) and
+-- auto-numbers new ones, so a survey's number never changes once issued.
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.survey_assignments') AND name = 'task_no')
+  ALTER TABLE dbo.survey_assignments ADD task_no INT IDENTITY(1,1) NOT NULL;
+GO
+
 PRINT 'Call_Reason schema created (23 tables).';
